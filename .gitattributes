@@ -1,0 +1,9 @@
+# normalise text to LF in the repo; Windows scripts keep CRLF in the working copy
+* text=auto
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.rtf text eol=crlf
+*.wxs text eol=crlf
+*.ico binary
+*.msi binary
+*.png binary

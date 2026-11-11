@@ -1,0 +1,6 @@
+# Run BeamLab:  pip install -r requirements.txt   then   python -m beamlab
+numpy>=1.24
+pillow>=10.0
+# camera SDKs (only the one for your camera is needed; the simulator needs neither)
+pypylon>=4.0            ; sys_platform == "win32" or sys_platform == "linux"
+imagingcontrol4>=1.2    ; sys_platform == "win32"
