@@ -108,8 +108,13 @@ def main():
     bottom_edge = app.bottom.winfo_rootx() + app.bottom.winfo_width()
     check(have >= need - 2 and right_edge <= bottom_edge + 1,
           'narrow window: readout not cut off (%d of %d px, inside the frame)' % (have, need))
-    check(app.prof_x.winfo_width() < pw, 'narrow window: profile graphs got narrower (%d -> %d px)'
-          % (pw, app.prof_x.winfo_width()))
+    # what matters on any screen (CI screens are small, so the "wide" window may
+    # already be narrow): graphs + readout together fit inside the window
+    used = app.prof_x.winfo_width() + app.prof_y.winfo_width() + app.readout.winfo_width()
+    check(used <= app.bottom.winfo_width() and app.prof_x.winfo_width() <= pw,
+          'narrow window: graphs shrink to fit beside the readout (%d + %d + %d <= %d px)'
+          % (app.prof_x.winfo_width(), app.prof_y.winfo_width(), app.readout.winfo_width(),
+             app.bottom.winfo_width()))
     # hide the graphs
     app.show_profiles.set(False)
     app.on_show_profiles()
