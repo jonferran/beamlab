@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  BeamLab installer (WiX 3.14). Built by installer\build.ps1.
+  Features:
+    BeamLab         the app (required)
+    Camera drivers  Basler pylon USB + Imaging Source USB3 Vision drivers (ON by default)
+                    command line: msiexec /i BeamLab-x.y.z.msi INSTALLDRIVERS=0  to skip them
+  The driver packages are separate .msi files. Windows Installer cannot run one .msi
+  inside another, so install_drivers.ps1 starts right AFTER this install finishes,
+  waits for the installer lock, and installs both with one admin prompt.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <?define Version = "$(var.ProductVersion)" ?>
+  <Product Id="*" Name="BeamLab $(var.Version)" Language="1033" Version="$(var.Version)"
+           Manufacturer="BeamLab" UpgradeCode="C33DDF85-A0D5-40D5-AABF-E1D44558DB95">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64"
+             Description="BeamLab laser beam analyzer" Comments="For the LBA-C-100 beam analyzer" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer BeamLab is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="BeamLabIcon" SourceFile="$(var.InstallerDir)\beamlab.ico" />
+    <Property Id="ARPPRODUCTICON" Value="BeamLabIcon" />
+
+    <!-- 1 = install the drivers (default). INSTALLDRIVERS=0 on the command line turns them off. -->
+    <Property Id="INSTALLDRIVERS" Value="1" Secure="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="BeamLab">
+          <Directory Id="DRIVERSFOLDER" Name="drivers" />
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="BeamLabMenuFolder" Name="BeamLab" />
+      </Directory>
+      <Directory Id="DesktopFolder" />
+      <Directory Id="System64Folder" />
+    </Directory>
+
+    <!-- Start menu + desktop shortcuts -->
+    <DirectoryRef Id="BeamLabMenuFolder">
+      <Component Id="AppShortcuts" Guid="*" Win64="yes">
+        <Shortcut Id="StartMenuBeamLab" Name="BeamLab" Description="Laser beam analyzer"
+                  Target="[INSTALLFOLDER]BeamLab.exe" WorkingDirectory="INSTALLFOLDER" Icon="BeamLabIcon" />
+        <RemoveFolder Id="RemoveStartMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\BeamLab" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="*" Win64="yes">
+        <Shortcut Id="DesktopBeamLab" Name="BeamLab" Description="Laser beam analyzer"
+                  Target="[INSTALLFOLDER]BeamLab.exe" WorkingDirectory="INSTALLFOLDER" Icon="BeamLabIcon" />
+        <RegistryValue Root="HKCU" Key="Software\BeamLab" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- the two vendor driver packages + the script that installs them -->
+    <DirectoryRef Id="DRIVERSFOLDER">
+      <Component Id="DriverPylon" Guid="*" Win64="yes">
+        <File Id="PylonDriverMsi" Source="$(var.InstallerDir)\drivers\pylon_USB_Camera_Driver.msi" KeyPath="yes" />
+      </Component>
+      <Component Id="DriverIC4" Guid="*" Win64="yes">
+        <File Id="IC4DriverMsi" Source="$(var.InstallerDir)\drivers\ic4-gentl-driver-usb3vision_1.6.0.894_Win_all.msi" KeyPath="yes" />
+      </Component>
+      <Component Id="DriverScript" Guid="*" Win64="yes">
+        <File Id="InstallDriversPs1" Source="$(var.InstallerDir)\install_drivers.ps1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+    <DirectoryRef Id="BeamLabMenuFolder">
+      <Component Id="DriverShortcut" Guid="*" Win64="yes">
+        <Shortcut Id="StartMenuDrivers" Name="Install camera drivers" Description="Install the LBA camera USB drivers"
+                  Target="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
+                  Arguments="-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File &quot;[DRIVERSFOLDER]install_drivers.ps1&quot;"
+                  WorkingDirectory="DRIVERSFOLDER" Icon="BeamLabIcon" />
+        <RegistryValue Root="HKCU" Key="Software\BeamLab" Name="DriverShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Main" Title="BeamLab" Description="The BeamLab application." Level="1"
+             Absent="disallow" AllowAdvertise="no" ConfigurableDirectory="INSTALLFOLDER">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="AppShortcuts" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+    <Feature Id="Drivers" Title="Camera drivers (recommended)"
+             Description="USB drivers for the LBA's camera: Basler pylon USB and The Imaging Source USB3 Vision. Installed right after BeamLab, with one administrator prompt. Skip this if they are already installed."
+             Level="1" AllowAdvertise="no">
+      <Condition Level="0"><![CDATA[INSTALLDRIVERS = "0"]]></Condition>
+      <ComponentRef Id="DriverPylon" />
+      <ComponentRef Id="DriverIC4" />
+      <ComponentRef Id="DriverScript" />
+      <ComponentRef Id="DriverShortcut" />
+    </Feature>
+
+    <!-- start the driver installs once this install is completely finished -->
+    <CustomAction Id="RunDriverInstall" Directory="DRIVERSFOLDER" Impersonate="yes" Return="asyncNoWait" Execute="immediate"
+                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File &quot;[DRIVERSFOLDER]install_drivers.ps1&quot;" />
+    <InstallExecuteSequence>
+      <Custom Action="RunDriverInstall" After="InstallFinalize"><![CDATA[(&Drivers = 3) AND NOT REMOVE]]></Custom>
+    </InstallExecuteSequence>
+
+    <UIRef Id="WixUI_FeatureTree" />
+    <UIRef Id="WixUI_ErrorProgressText" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.InstallerDir)\license.rtf" />
+  </Product>
+</Wix>

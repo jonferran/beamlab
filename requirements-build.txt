@@ -1,0 +1,5 @@
+# Build the Windows installer (installer\build.ps1); WiX 3.14 is separate (see README)
+-r requirements.txt
+pyinstaller>=6.0
+# plotting logs (tools/plot_log.py)
+matplotlib>=3.7
