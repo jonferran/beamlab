@@ -165,6 +165,23 @@ def test_widths_do_not_depend_on_position_with_averaging():
     assert (e2.max() - e2.min()) / e2.mean() < 0.05, (e2.min(), e2.max())
 
 
+def test_exposure_capped_at_400ms():
+    from beamlab.cameras import open_camera, MAX_EXPOSURE_US
+    cam = open_camera('sim')
+    assert MAX_EXPOSURE_US == 400000.0 and cam.exposure_range[1] == 400000.0, cam.exposure_range
+    # auto exposure can reach the cap on a very dim beam, and not beyond
+    dim = SimCamera(width=640, height=480, wander=False, fps=10000, powers_w=(0.0002, 0, 0))
+    dim.exposure_range = cam.exposure_range
+    dim.set_exposure(1000)
+    ae = analysis.AutoExposure()
+    for _ in range(60):
+        raw, used, _ = dim.grab()
+        new = ae.update(raw, used, *dim.exposure_range)
+        if new != used:
+            dim.set_exposure(new)
+    assert dim.exp <= 400000.0 and dim.exp > 100000.0, dim.exp
+
+
 def test_still_beam_is_still_averaged():
     cam = sim(powers_w=(0.05, 0.04, 0.03))
     cam.set_exposure(1500)

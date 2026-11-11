@@ -138,14 +138,43 @@ def main():
     cx, cy = x0 + vw / 2, y0 + vh / 2
     check(abs(vw - W / 4) < 1e-6, 'zoom 4x window is a quarter of the width')
     check(abs(cx - res['cx_px']) < 1.0 and abs(cy - res['cy_px']) < 1.0, 'zoom follows the beam centre')
-    # ---- a click maps back to analysis px through the zoom
-    app.click_mode = 'crosshair'
+    # ---- crosshair readout: (0, 0) at the sensor centre, no "sensor centre" text
+    app.set_crosshair(None)
+    txt = app.cross_info.cget('text')
+    check('+0.000' in txt and 'centre' not in txt.lower(), 'crosshair at the centre reads (0, 0): %r' % txt)
+    # ---- a plain left click (press + release, no drag) puts the crosshair at the cursor
     ox, oy, sc, gx0, gy0 = app._geom['live']
     tx, ty = res['cx_px'] + 5.0, res['cy_px'] - 3.0
     ev = type('E', (), {'x': ox + (tx - gx0) * sc, 'y': oy + (ty - gy0) * sc})()
-    app.on_live_click(ev)
+    app.on_live_press(ev)
+    app.on_live_release(ev)
     c = app.s['crosshair_px']
-    check(abs(c[0] - tx) < 0.5 and abs(c[1] - ty) < 0.5, 'click places the crosshair at the right spot when zoomed')
+    check(c is not None and abs(c[0] - tx) < 0.5 and abs(c[1] - ty) < 0.5,
+          'left click places the crosshair at the cursor (also when zoomed)')
+    x, y, xm, ym = app.cross_coords()
+    check(abs(x - (tx - W / 2.0)) < 0.5 and abs(y - (H / 2.0 - ty)) < 0.5 and (xm > 0) == (x > 0),
+          'crosshair coordinates are relative to the sensor centre, +y up (%.1f, %.1f px)' % (x, y))
+    check(not hasattr(app, 'btn_place'), 'no "Place by click" button any more')
+    # ---- auto exposure stays ON while it moves the slider itself
+    app.auto_exp.set(True)
+    for us in (900.0, 1500.0, 2500.0, 4000.0):
+        app._set_exp_widgets(us)
+        pump(root, 0.05)                     # Tk delivers the slider command when idle
+    check(app.auto_exp.get(), 'auto exposure stays on while it moves the slider')
+    # ... and a real drag by the user still takes over
+    app._slider_user(True)
+    app.exp_slider.set(app.exp_slider.get() - 40)
+    pump(root, 0.05)
+    app._slider_user(False)
+    pump(root, 0.3)
+    check(not app.auto_exp.get(), 'dragging the slider yourself switches auto exposure off')
+    check(not app._dragging, 'slider is "not dragging" again after release')
+    # ---- exposure range ends at 400 ms
+    app.on_opened({'serial': 'SIM0001', 'name': 'Simulator', 'model': 'x', 'exposure_range': (20.0, 10e6)})
+    check(app.exposure_range[1] == 400000.0 and '400 ms' in app.exp_range_label.cget('text'),
+          'exposure slider ends at 400 ms (%s)' % app.exp_range_label.cget('text'))
+    app._set_exp_widgets(400000.0)
+    check(app.exp_slider.get() == 1000, 'slider at its end = 400 ms')
     # ---- crosshair mode centres on the crosshair
     app.zoom_follow.set('Crosshair')
     app.draw(msg)

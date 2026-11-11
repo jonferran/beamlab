@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw, ImageTk
 
 from . import settings as S
 from . import worker
+from .cameras import MAX_EXPOSURE_US
 
 BG = '#202124'
 PANEL = '#2b2c2f'
@@ -58,15 +59,13 @@ class App(object):
         self.out_q = None
         self.serial = None
         self.cam_name = ''
-        self.exposure_range = (20.0, 1000000.0)
+        self.exposure_range = (20.0, MAX_EXPOSURE_US)
         self.last = None             # last 'frame' message
         self.snapshot = None         # {'img': PIL.Image, 'meta': dict, 'path': str}
-        self.click_mode = None       # 'crosshair' while waiting for a click
         self.csv_file = None
         self.csv_writer = None
         self.calibrating = None      # laser index while a calibration runs
         self._exp_send_job = None
-        self._slider_from_code = False
         self._geom = {}              # canvas -> (ox, oy, display px per analysis px, x0, y0)
         self._zc = None              # smoothed zoom centre (analysis px)
         self._pan = None             # manual zoom centre (analysis px)
@@ -235,9 +234,13 @@ class App(object):
                                    highlightthickness=0, command=self.on_exp_slider)
         self.exp_slider.pack(fill='x')
         self._dragging = False
-        self.exp_slider.bind('<ButtonPress-1>', lambda e: setattr(self, '_dragging', True))
-        self.exp_slider.bind('<ButtonRelease-1>', lambda e: setattr(self, '_dragging', False))
-        ttk.Label(f, text='slider: 20 us ... longest (logarithmic)', style='Dim.TLabel').pack(anchor='w')
+        self._slider_release_job = None
+        self.exp_slider.bind('<ButtonPress-1>', lambda e: self._slider_user(True))
+        self.exp_slider.bind('<ButtonRelease-1>', lambda e: self._slider_user(False))
+        self.exp_slider.bind('<KeyPress>', lambda e: self._slider_user(True))
+        self.exp_slider.bind('<KeyRelease>', lambda e: self._slider_user(False))
+        self.exp_range_label = ttk.Label(f, text='', style='Dim.TLabel')
+        self.exp_range_label.pack(anchor='w')
         r = ttk.Frame(f)
         r.pack(fill='x')
         ttk.Label(r, text='Exact (us)').pack(side='left')
@@ -258,6 +261,8 @@ class App(object):
         self.roi_info = ttk.Label(f, text='', style='Dim.TLabel', wraplength=290)
         self.roi_info.pack(anchor='w')
         self._roi_text()
+        self._exp_range_text()
+        self._set_exp_widgets(self.s['exposure_us'])
 
     def _roi_text(self):
         if self.auto_roi.get():
@@ -290,7 +295,11 @@ class App(object):
         self.auto_roi.set(False)
         self.send_set({'auto_roi': False, 'roi': roi})
         self._roi_text()
-        self._set_exp_widgets(self.s['exposure_us'])
+
+    def _exp_range_text(self):
+        lo, hi = self.exposure_range
+        f = lambda us: ('%.0f ms' % (us / 1000)) if us >= 1000 else ('%.0f us' % us)
+        self.exp_range_label.configure(text='slider: %s ... %s (logarithmic)' % (f(lo), f(hi)))
 
     def _exp_to_slider(self, us):
         lo, hi = self.exposure_range
@@ -302,16 +311,32 @@ class App(object):
 
     def _set_exp_widgets(self, us):
         self.exp_label.configure(text=('%.1f ms' % (us / 1000)) if us >= 1000 else ('%.0f us' % us))
-        self._slider_from_code = True
-        self.exp_slider.set(self._exp_to_slider(max(us, self.exposure_range[0])))
-        self._slider_from_code = False
+        # Tk calls the slider's command LATER (when idle), after any "set by code" flag
+        # would already be cleared - so the app's own moves looked like a user drag and
+        # switched auto exposure off. on_exp_slider now only acts on real user input.
+        self.exp_slider.set(self._exp_to_slider(min(max(us, self.exposure_range[0]), self.exposure_range[1])))
         if self.root.focus_get() is not self.exp_entry:
             self.exp_entry.delete(0, 'end')
             self.exp_entry.insert(0, '%.0f' % us)
 
+    def _slider_user(self, active):
+        """Mouse/keyboard on the exposure slider. Release is delayed a little so the
+        deferred command from the last movement still counts as the user's."""
+        if active:
+            if self._slider_release_job:
+                self.root.after_cancel(self._slider_release_job)
+                self._slider_release_job = None
+            self._dragging = True
+        else:
+            self._slider_release_job = self.root.after(150, self._slider_released)
+
+    def _slider_released(self):
+        self._slider_release_job = None
+        self._dragging = False
+
     def on_exp_slider(self, v):
-        if self._slider_from_code:
-            return
+        if not self._dragging:
+            return                        # moved by the app (auto exposure / typed value): ignore
         us = self._slider_to_exp(v)
         if self.auto_exp.get():           # dragging takes over from auto
             self.auto_exp.set(False)
@@ -709,11 +734,11 @@ class App(object):
         f = self._box(p, 'Crosshair (alignment reference)')
         self.show_cross = tk.BooleanVar(value=self.s['show_crosshair'])
         ttk.Checkbutton(f, text='Show crosshair', variable=self.show_cross).pack(anchor='w')
+        ttk.Label(f, text='Left-click the picture to put the crosshair there '
+                  '(left-drag draws an ROI).', style='Dim.TLabel', wraplength=290).pack(anchor='w')
         r = ttk.Frame(f)
         r.pack(fill='x')
-        self.btn_place = ttk.Button(r, text='Place by click', command=self.place_by_click)
-        self.btn_place.pack(side='left')
-        ttk.Button(r, text='Sensor centre', command=self.cross_centre).pack(side='left', padx=4)
+        ttk.Button(r, text='Centre (0, 0)', command=self.cross_centre).pack(side='left')
         r = ttk.Frame(f)
         r.pack(fill='x', pady=(3, 0))
         ttk.Label(r, text='Snap to').pack(side='left')
@@ -735,30 +760,45 @@ class App(object):
         self.cross_info.pack(anchor='w')
         self._update_cross_info()
 
-    def _update_cross_info(self):
-        c = self.s.get('crosshair_px')
-        self.cross_info.configure(text='At sensor centre' if not c else 'At x %.1f, y %.1f (analysis px)' % tuple(c))
+    def _sensor_shape(self):
+        """(h, w) of the analysis image, from the live frames (remembered for later)."""
+        if self.last:
+            self.s['sensor_shape'] = list(self.last['result']['shape'])
+        return self.s.get('sensor_shape')
 
-    def place_by_click(self):
-        self.click_mode = 'crosshair'
-        self.status.configure(text='Click on the live view where the crosshair should go.')
+    def cross_coords(self):
+        """Crosshair position with (0, 0) at the sensor centre, +x right, +y UP:
+        (x_px, y_px) in analysis px and (x_mrad, y_mrad), or None before any frame."""
+        c = self.s.get('crosshair_px')
+        shape = self._sensor_shape()
+        if not c or not shape:
+            return (0.0, 0.0, 0.0, 0.0)          # no crosshair set = the centre = (0, 0)
+        h, w = shape
+        o = self.s['optics']
+        k = 2 * o['pixel_pitch_um'] * 1e-3 / o['focal_mm'] * 1000
+        x, y = c[0] - w / 2.0, -(c[1] - h / 2.0)
+        return (x, y, x * k, y * k)
+
+    def _update_cross_info(self):
+        x, y, xm, ym = self.cross_coords()
+        self.cross_info.configure(text='Crosshair at x %+.3f, y %+.3f mrad  (%+.1f, %+.1f px)'
+                                  % (xm + 0.0, ym + 0.0, x + 0.0, y + 0.0))
 
     def _to_analysis(self, ex, ey):
         ox, oy, sc, x0, y0 = self._geom['live']
         return (ex - ox) / sc + x0, (ey - oy) / sc + y0
 
     def on_live_click(self, ev):
-        if self.click_mode != 'crosshair' or 'live' not in self._geom:
+        """Put the crosshair where the picture was clicked."""
+        if 'live' not in self._geom:
             return
         self.set_crosshair(list(self._to_analysis(ev.x, ev.y)))
-        self.click_mode = None
         self.status.configure(text='Crosshair placed.')
 
-    # left button: click places the crosshair (in "Place by click" mode), drag draws the ROI
+    # left button: a click puts the crosshair at the cursor, a drag draws the ROI
     def on_live_press(self, ev):
-        if self.click_mode == 'crosshair':
-            self.on_live_click(ev)
-            return
+        if self._fs:
+            return                         # this click only wakes the window from full screen
         if 'live' in self._geom:
             self._roi_drag = (ev.x, ev.y)
 
@@ -775,8 +815,12 @@ class App(object):
         sx, sy = self._roi_drag
         self._roi_drag = None
         self.live.delete('roidrag')
+        if abs(ev.x - sx) < 6 and abs(ev.y - sy) < 6:
+            # a plain click (not a drag): crosshair to where the button went down
+            self.on_live_click(type('Click', (), {'x': sx, 'y': sy})())
+            return
         if abs(ev.x - sx) < 6 or abs(ev.y - sy) < 6:
-            return                                    # a plain click, not a drag
+            return                                    # a thin line, not an ROI
         ax0, ay0 = self._to_analysis(min(sx, ev.x), min(sy, ev.y))
         ax1, ay1 = self._to_analysis(max(sx, ev.x), max(sy, ev.y))
         h, w = self.last['result']['shape'] if self.last else (1e9, 1e9)
@@ -1097,6 +1141,7 @@ class App(object):
             return
         self.s['optics'] = o
         self._optics_text()
+        self._update_cross_info()                # mrad scale changed
         self.send_set({'optics': o})
 
     # ---------------------------------------------------------------- CSV
@@ -1316,12 +1361,16 @@ class App(object):
             self.draw(latest)
             if first or latest.get('calibrating') != (self.calibrating is not None):
                 self._refresh_blocked()
+            if first:
+                self._update_cross_info()        # now the sensor size is known
         self.root.after(15, self.poll)
 
     def on_opened(self, m):
         self.serial = m['serial']
         self.cam_name = '%s %s' % (m['name'], m['model'])
-        self.exposure_range = tuple(m['exposure_range'])
+        lo, hi = m['exposure_range']
+        self.exposure_range = (float(lo), float(min(hi, MAX_EXPOSURE_US)))
+        self._exp_range_text()
         self.cam_info.configure(text='%s\nmodel %s, serial %s' % (m['name'], m['model'], m['serial']))
         self.status.configure(text='Streaming.')
         self._set_exp_widgets(self.s['exposure_us'])

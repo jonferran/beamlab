@@ -15,6 +15,9 @@ import time
 import numpy as np
 
 
+MAX_EXPOSURE_US = 400000.0   # 400 ms: the longest exposure offered (as the LBA's own software)
+
+
 class CameraError(Exception):
     pass
 
@@ -201,7 +204,7 @@ class SimCamera(Camera):
         self.sigma = sigma_px            # in SENSOR pixels
         self.k = counts_per_w_ms
         self.exp = 5000.0
-        self.exposure_range = (20.0, 200000.0)
+        self.exposure_range = (20.0, 400000.0)
         self.rng = np.random.default_rng(seed)
         self.wander = wander
         self.t0 = time.time()
@@ -266,14 +269,21 @@ class SimCamera(Camera):
 BACKENDS = {'auto': None, 'pylon': PylonCamera, 'ic4': IC4Camera, 'sim': SimCamera}
 
 
+def _cap(cam):
+    """Longest exposure BeamLab uses (slider, typed value and auto exposure)."""
+    lo, hi = cam.exposure_range
+    cam.exposure_range = (float(lo), float(min(hi, MAX_EXPOSURE_US)))
+    return cam
+
+
 def open_camera(kind='auto', serial=None):
     """'auto' tries Basler then Imaging Source and reports why both failed."""
     if kind != 'auto':
-        return BACKENDS[kind](serial) if kind != 'sim' else SimCamera(laser_on_after=15)
+        return _cap(BACKENDS[kind](serial) if kind != 'sim' else SimCamera(laser_on_after=15))
     errs = []
     for cls in (PylonCamera, IC4Camera):
         try:
-            return cls(serial)
+            return _cap(cls(serial))
         except Exception as e:     # noqa: BLE001 - report every backend's reason
             errs.append('%s: %s' % (cls.name, e))
     raise CameraError('No camera opened.\n' + '\n'.join(errs))

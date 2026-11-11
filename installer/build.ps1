@@ -3,7 +3,7 @@
 #        WiX 3.14 binaries in %USERPROFILE%\tools\wix314 (or set -Wix);
 #        the two vendor driver MSIs in installer\drivers\ (see installer\drivers\README.md).
 param(
-    [string]$Version = '0.1.2',
+    [string]$Version = '0.1.3',
     [string]$Wix = "$env:USERPROFILE\tools\wix314"
 )
 $ErrorActionPreference = 'Stop'

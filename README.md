@@ -70,7 +70,7 @@ divergence: **angle = size on sensor / focal length**.
   (right-drag), and centring on the beam or the crosshair.
 - **Display colours for goggles:** show each laser in any colour, plus a
   brightness slider per laser. Measurements are not affected.
-- **Crosshair** reference: place it by click, at the sensor centre, or snap it
+- **Crosshair** reference: left-click the picture to place it, or centre it, or snap it
   to the beam or one colour.
 - **Snapshot:** a still reference picture shown next to the live view, with
   its divergence numbers, saved as PNG + JSON.
