@@ -19,7 +19,9 @@ from PIL import Image, ImageDraw, ImageTk
 
 from . import settings as S
 from . import worker
+from . import __version__
 from .cameras import MAX_EXPOSURE_US
+from .settings import log_error
 
 BG = '#202124'
 PANEL = '#2b2c2f'
@@ -44,6 +46,35 @@ def fmt(v, nd=3, unit=''):
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return '--'
     return ('%.' + str(nd) + 'f%s') % (v, unit)
+
+
+def pick_detail(view, img, step, detail):
+    """The picture to draw `view` (x0, y0, w, h analysis px) from: the zoomed-in
+    full-resolution window when it covers the view, else the whole-sensor picture.
+    img / detail['img'] may be numpy arrays or PIL images -> (img, step, origin)."""
+    if detail:
+        x0, y0, vw, vh = view
+        bx0, by0, bx1, by1 = detail['box']
+        if bx0 <= x0 + 1e-6 and by0 <= y0 + 1e-6 and x0 + vw <= bx1 + 1e-6 and y0 + vh <= by1 + 1e-6:
+            return detail['img'], detail['step'], (bx0, by0)
+    return img, step, (0, 0)
+
+
+def overlay_snapshot(live, snap, strength=1.0, region=None):
+    """Lay a snapshot over the live preview: each pixel keeps the brighter of the
+    two (the snapshot dimmed to `strength`), so a beam you snapped and then turned
+    off stays on screen next to the live one. live: HxWx3 uint8; snap: PIL image
+    of the whole sensor (any preview step); region = the part of `snap` (its px)
+    that `live` shows, default all of it -> HxWx3 uint8."""
+    h, w = live.shape[:2]
+    if region is not None:
+        snap = snap.resize((w, h), Image.BICUBIC, box=tuple(region))
+    elif snap.size != (w, h):   # area average when shrinking keeps a tight spot sharp
+        snap = snap.resize((w, h), Image.BOX if snap.size[0] > w else Image.BILINEAR)
+    s = np.asarray(snap.convert('RGB'), dtype=np.uint8)
+    if strength < 0.999:
+        s = (s.astype(np.float32) * max(0.0, float(strength))).astype(np.uint8)
+    return np.maximum(live, s)
 
 
 def hexcol(c):
@@ -74,6 +105,11 @@ class App(object):
         self._last_act = time.time()
         self._ptr = None
         self._ignore_until = 0.0
+        self._frame_no = 0           # frames shown since connecting
+        self._last_frame_t = None
+        self._stall_reported = False
+        self._errors_shown = set()
+        root.report_callback_exception = self._on_tk_error   # no silent errors in callbacks
         root.title('BeamLab - laser beam analyzer')
         root.configure(bg=BG)
         root.geometry('1500x900')
@@ -124,6 +160,13 @@ class App(object):
         self._build_power(self.left)
         self._build_optics(self.left)
         self._build_log(self.left)
+        # Jon's order, top to bottom (built in the order above: some boxes use
+        # widgets of others, so they are only re-packed here)
+        for title in self.PANEL_ORDER:
+            f = self._boxes.get(title)
+            if f is not None:
+                f.pack_forget()
+                f.pack(fill='x', padx=6, pady=4)
         # ---- right: views + readouts
         right = ttk.Frame(outer)
         right.pack(side='left', fill='both', expand=True)
@@ -181,9 +224,15 @@ class App(object):
         self.s['show_profiles'] = self.show_profiles.get()
         self._pack_profiles(self.show_profiles.get())
 
+    PANEL_ORDER = ('Camera', 'Crosshair (alignment reference)', 'View', 'Exposure',
+                   'Display colours (for goggles)', 'Snapshot', 'Optics (pixels -> mrad)',
+                   'Power calibration', 'Log measurements')
+
     def _box(self, parent, title):
         f = ttk.LabelFrame(parent, text=title, padding=6)
         f.pack(fill='x', padx=6, pady=4)
+        self._boxes = getattr(self, '_boxes', {})
+        self._boxes[title] = f
         return f
 
     def _reason(self, parent):
@@ -233,6 +282,7 @@ class App(object):
                                    length=290, bg=PANEL, fg=FG, troughcolor='#444',
                                    highlightthickness=0, command=self.on_exp_slider)
         self.exp_slider.pack(fill='x')
+        self._on_right_reset(self.exp_slider, self.reset_exposure)
         self._dragging = False
         self._slider_release_job = None
         self.exp_slider.bind('<ButtonPress-1>', lambda e: self._slider_user(True))
@@ -252,12 +302,24 @@ class App(object):
         r.pack(fill='x', pady=(4, 0))
         ttk.Label(r, text='Average frames').pack(side='left')
         self.stack = tk.IntVar(value=self.s['stack'])
-        tk.Scale(r, from_=1, to=30, orient='horizontal', variable=self.stack, length=150,
-                 bg=PANEL, fg=FG, troughcolor='#444', highlightthickness=0,
-                 command=lambda v: self.send_set({'stack': int(float(v))})).pack(side='left')
+        sc = tk.Scale(r, from_=1, to=30, orient='horizontal', variable=self.stack, length=150,
+                      bg=PANEL, fg=FG, troughcolor='#444', highlightthickness=0,
+                      command=lambda v: self.send_set({'stack': int(float(v))}))
+        sc.pack(side='left')
+        self._on_right_reset(sc, lambda: (self.stack.set(int(S.DEFAULTS['stack'])),
+                                          self.send_set({'stack': int(S.DEFAULTS['stack'])})))
         self.auto_roi = tk.BooleanVar(value=self.s['auto_roi'])
         ttk.Checkbutton(f, text='Auto ROI (follow the spot)', variable=self.auto_roi,
                         command=self.on_auto_roi).pack(anchor='w')
+        # the LBA shows 3 spots side by side: measure the one you use
+        r = ttk.Frame(f)
+        r.pack(fill='x')
+        ttk.Label(r, text='Measure').pack(side='left')
+        self.spot = tk.StringVar(value=self.SPOT_NAMES.get(self.s.get('spot', 'right'), 'Right spot'))
+        cb = ttk.Combobox(r, textvariable=self.spot, values=list(self.SPOT_NAMES.values()), width=14,
+                          state='readonly')
+        cb.pack(side='left', padx=4)
+        cb.bind('<<ComboboxSelected>>', lambda e: self.on_spot())
         self.roi_info = ttk.Label(f, text='', style='Dim.TLabel', wraplength=290)
         self.roi_info.pack(anchor='w')
         self._roi_text()
@@ -351,6 +413,29 @@ class App(object):
         self._exp_send_job = None
         self.send_set({'exposure_us': self.s['exposure_us']})
 
+    SPOT_NAMES = {'right': 'Right spot', 'middle': 'Middle spot', 'left': 'Left spot',
+                  'brightest': 'Brightest spot'}
+
+    def spot_key(self):
+        name = self.spot.get()
+        return next((k for k, v in self.SPOT_NAMES.items() if v == name), 'right')
+
+    def on_spot(self):
+        self.s['spot'] = self.spot_key()
+        self.send_set({'spot': self.s['spot']})
+
+    def _on_right_reset(self, widget, fn):
+        """Right-click a slider = back to its default value."""
+        self._reset_fns = getattr(self, '_reset_fns', [])
+        self._reset_fns.append((widget, fn))
+        widget.bind('<Button-3>', lambda e: (fn(), 'break')[1])
+
+    def reset_exposure(self):
+        """Right-click on the exposure slider: the default exposure (auto exposure off)."""
+        self.exp_entry.delete(0, 'end')
+        self.exp_entry.insert(0, '%g' % S.DEFAULTS['exposure_us'])
+        self.on_exp_entry()
+
     def on_exp_entry(self):
         try:
             us = float(self.exp_entry.get())
@@ -383,9 +468,11 @@ class App(object):
         r.pack(fill='x')
         ttk.Label(r, text='Zoom').pack(side='left')
         self.zoom = tk.DoubleVar(value=float(self.s.get('zoom', 1.0)))
-        tk.Scale(r, from_=1, to=16, resolution=0.25, orient='horizontal', variable=self.zoom,
-                 length=170, bg=PANEL, fg=FG, troughcolor='#444', highlightthickness=0,
-                 command=lambda v: self.on_zoom_slider()).pack(side='left')
+        sc = tk.Scale(r, from_=1, to=16, resolution=0.25, orient='horizontal', variable=self.zoom,
+                      length=170, bg=PANEL, fg=FG, troughcolor='#444', highlightthickness=0,
+                      command=lambda v: self.on_zoom_slider())
+        sc.pack(side='left')
+        self._on_right_reset(sc, lambda: self.set_zoom(1.0))
         ttk.Button(r, text='1x', width=3, command=lambda: self.set_zoom(1.0)).pack(side='left', padx=2)
         r = ttk.Frame(f)
         r.pack(fill='x')
@@ -657,6 +744,9 @@ class App(object):
                   style='Dim.TLabel', wraplength=290).pack(anchor='w')
         self.swatches = []
         self.atten_vars, self.atten_labels = [], []
+        self.boost_vars, self.boost_labels, self.lcon_vars, self.lcon_labels = [], [], [], []
+        self.learn_btns, self.learn_labels = [], []
+        self._learning = None        # [laser, rates list, frames wanted] while learning
         for i, name in enumerate(S.LASERS):
             r = ttk.Frame(f)
             r.pack(fill='x', pady=1)
@@ -666,6 +756,14 @@ class App(object):
                           command=lambda i=i: self.pick_colour(i))
             b.pack(side='left')
             self.swatches.append(b)
+            # learn how this laser shows in the camera's R/G/B pixels (display only),
+            # so overlapping beams separate on screen without a power calibration
+            lb = ttk.Button(r, text='Learn', width=6, command=lambda i=i: self.learn_colour(i))
+            lb.pack(side='left', padx=(6, 2))
+            ll = ttk.Label(r, text='', style='Dim.TLabel', width=9)
+            ll.pack(side='left')
+            self.learn_btns.append(lb)
+            self.learn_labels.append(ll)
             # on-screen attenuation of this laser (display only)
             r = ttk.Frame(f)
             r.pack(fill='x')
@@ -675,10 +773,46 @@ class App(object):
                           bg=PANEL, fg=FG, troughcolor='#444', highlightthickness=0, showvalue=False,
                           command=lambda val, i=i: self.on_atten(i))
             sc.pack(side='left')
+            self._on_right_reset(sc, lambda v=v, i=i: (v.set(100), self.on_atten(i)))
             lab = ttk.Label(r, text='%d %%' % v.get(), width=6)
             lab.pack(side='left')
             self.atten_vars.append(v)
             self.atten_labels.append(lab)
+            # this laser's own boost and contrast (display only)
+            for kind, lo, hi, res, fmt_ in (('boost', 0.2, 10.0, 0.1, '%.1fx'),
+                                            ('contrast', -100, 100, 5, '%+d')):
+                r = ttk.Frame(f)
+                r.pack(fill='x')
+                ttk.Label(r, text='   ' + kind, width=12, style='Dim.TLabel').pack(side='left')
+                if kind == 'boost':
+                    v = tk.DoubleVar(value=float(self.s['display'].get('boost', [1, 1, 1])[i]))
+                else:
+                    v = tk.IntVar(value=int(self.s['display'].get('lcontrast', [0, 0, 0])[i]))
+                lab = ttk.Label(r, text=fmt_ % v.get(), width=6)
+                sc = tk.Scale(r, from_=lo, to=hi, resolution=res, orient='horizontal', variable=v,
+                              length=150, bg=PANEL, fg=FG, troughcolor='#444', highlightthickness=0,
+                              showvalue=False,
+                              command=lambda val, v=v, lab=lab, fmt_=fmt_: self.on_laser_tone(v, lab, fmt_))
+                sc.pack(side='left')
+                dflt = 1.0 if kind == 'boost' else 0
+                self._on_right_reset(sc, lambda v=v, lab=lab, fmt_=fmt_, dflt=dflt:
+                                     (v.set(dflt), self.on_laser_tone(v, lab, fmt_)))
+                lab.pack(side='left')
+                (self.boost_vars if kind == 'boost' else self.lcon_vars).append(v)
+                (self.boost_labels if kind == 'boost' else self.lcon_labels).append(lab)
+        self.learn_reason = self._reason(f)
+        self.learn_reason.pack(anchor='w')
+        self.learn_info = ttk.Label(f, text='Learn: turn ONE laser on, press its Learn. Then its sliders '
+                                    'act on that laser only, even where beams overlap.',
+                                    style='Dim.TLabel', wraplength=290)
+        self.learn_info.pack(anchor='w')
+        r = ttk.Frame(f)
+        r.pack(fill='x', pady=(2, 0))
+        ttk.Button(r, text='Reset sliders', command=self.reset_laser_tone).pack(side='left')
+        self.btn_forget = ttk.Button(r, text='Forget learned colours', command=self.forget_colours)
+        self.btn_forget.pack(side='left', padx=4)
+        ttk.Label(f, text='Right-click any slider to put it back to its default.',
+                  style='Dim.TLabel', wraplength=290).pack(anchor='w')
         r = ttk.Frame(f)
         r.pack(fill='x', pady=(4, 0))
         ttk.Label(r, text='Preset').pack(side='left')
@@ -690,13 +824,34 @@ class App(object):
         self.auto_bright = tk.BooleanVar(value=self.s['display']['auto_bright'])
         ttk.Checkbutton(f, text='Auto brightness (dim beams fill the screen)',
                         variable=self.auto_bright, command=self.push_display).pack(anchor='w')
+        # the camera sees 638 nm red ~5x weaker than the lasers look to the eye
+        self.balance = tk.BooleanVar(value=bool(self.s['display'].get('balance', True)))
+        ttk.Checkbutton(f, text='Balance lasers (each at full brightness)',
+                        variable=self.balance, command=self.push_display).pack(anchor='w')
         r = ttk.Frame(f)
         r.pack(fill='x')
-        ttk.Label(r, text='Boost').pack(side='left')
+        ttk.Label(r, text='Boost (all)').pack(side='left')
         self.gain = tk.DoubleVar(value=self.s['display']['gain'])
-        tk.Scale(r, from_=0.2, to=10, resolution=0.1, orient='horizontal', variable=self.gain,
-                 length=200, bg=PANEL, fg=FG, troughcolor='#444', highlightthickness=0,
-                 command=lambda v: self.push_display()).pack(side='left')
+        sc = tk.Scale(r, from_=0.2, to=10, resolution=0.1, orient='horizontal', variable=self.gain,
+                      length=200, bg=PANEL, fg=FG, troughcolor='#444', highlightthickness=0,
+                      command=lambda v: self.push_display())
+        sc.pack(side='left')
+        self._on_right_reset(sc, lambda: (self.gain.set(1.0), self.push_display()))
+        # contrast: a brightness curve (display only). Left lifts the faint wings
+        # of the beam, right darkens them so only the bright core shows.
+        r = ttk.Frame(f)
+        r.pack(fill='x')
+        ttk.Label(r, text='Contrast (all)').pack(side='left')
+        self.contrast = tk.IntVar(value=int(self.s['display'].get('contrast', 0)))
+        sc = tk.Scale(r, from_=-100, to=100, resolution=5, orient='horizontal', variable=self.contrast,
+                      length=180, bg=PANEL, fg=FG, troughcolor='#444', highlightthickness=0,
+                      command=lambda v: self.on_contrast())
+        sc.pack(side='left')
+        self._on_right_reset(sc, lambda: (self.contrast.set(0), self.on_contrast()))
+        ttk.Button(r, text='0', width=3, command=lambda: (self.contrast.set(0), self.on_contrast())
+                   ).pack(side='left', padx=(4, 0))
+        ttk.Label(f, text='Contrast: left shows the faint edges of the beam, right only its '
+                  'bright core. Display only.', style='Dim.TLabel', wraplength=290).pack(anchor='w')
         ttk.Label(f, text='Colours separate cleanly once each laser is power-calibrated; '
                   'before that, the camera\'s raw R/G/B pixels are used.',
                   style='Dim.TLabel', wraplength=290).pack(anchor='w')
@@ -719,11 +874,105 @@ class App(object):
             self.root.after_cancel(self._atten_job)
         self._atten_job = self.root.after(50, self.push_display)
 
+    # -------------------------------------------------- learned laser colours
+    LEARN_FRAMES = 5
+
+    def _colour_sigs(self):
+        """The learned [r, g, b] signature of each laser on this camera (or None)."""
+        sig = self.s.setdefault('colour_sigs', {}).get(self.serial or '', None) or [None, None, None]
+        return list(sig) + [None] * (3 - len(sig))
+
+    def learn_colour(self, i):
+        self._learning = [i, [], self.LEARN_FRAMES]
+        self.learn_labels[i].configure(text='learning...')
+        self._refresh_blocked()
+
+    def _learn_frame(self, res):
+        """Called for every frame: collects the light of the laser being learned."""
+        if self._learning is None:
+            return
+        i, got, want = self._learning
+        name = S.LASERS[i]
+        problem = None
+        if not res.get('ok'):
+            problem = 'No beam seen. Turn the %s laser on (only that one) and press Learn again.' % name
+        elif max(res['peak_raw']) >= res.get('full', 255.0) * 254.0 / 255.0:
+            problem = ('The sensor is saturated, so the colour would come out wrong. Lower the '
+                       'exposure (or turn Auto exposure on) and press Learn again.')
+        if problem:
+            self._learning = None
+            self.learn_labels[i].configure(text='')
+            self._refresh_blocked()
+            self.learn_reason.configure(text=problem)
+            return
+        got.append(np.asarray(res['rates'], float))
+        if len(got) < want:
+            return
+        self._learning = None
+        sig = np.mean(got, axis=0)
+        sig = np.clip(sig, 0, None)
+        if sig.max() <= 0:
+            self.learn_reason.configure(text='No light measured. Turn the %s laser on and try again.' % name)
+            self._update_learn_labels()
+            return
+        sig = sig / sig.max()
+        main = int(np.argmax(sig))
+        sigs = self._colour_sigs()
+        sigs[i] = [round(float(v), 4) for v in sig]
+        self.s.setdefault('colour_sigs', {})[self.serial or ''] = sigs
+        S.save(self._collect())
+        self.push_response()
+        note = ''
+        if main != i:
+            note = ('Note: this light is mostly %s in the camera. If that is not the %s laser, '
+                    'turn on only the %s laser and press Learn again.'
+                    % (['red', 'green', 'blue'][main], name, name))
+        self.learn_reason.configure(text=note)
+        self._update_learn_labels()
+        self._refresh_blocked()
+
+    def _update_learn_labels(self):
+        for i, sig in enumerate(self._colour_sigs()):
+            if self._learning is not None and self._learning[0] == i:
+                continue
+            self.learn_labels[i].configure(text='learned' if sig else '')
+
+    def forget_colours(self):
+        self.s.setdefault('colour_sigs', {}).pop(self.serial or '', None)
+        S.save(self._collect())
+        self.push_response()
+        self._update_learn_labels()
+        self.learn_reason.configure(text='')
+        self._refresh_blocked()
+
+    def on_laser_tone(self, v, lab, fmt_):
+        lab.configure(text=fmt_ % v.get())
+        self.on_contrast()                              # same throttled push
+
+    def reset_laser_tone(self):
+        for i in range(len(self.atten_vars)):
+            self.atten_vars[i].set(100)
+            self.atten_labels[i].configure(text='100 %')
+            self.boost_vars[i].set(1.0)
+            self.boost_labels[i].configure(text='1.0x')
+            self.lcon_vars[i].set(0)
+            self.lcon_labels[i].configure(text='+0')
+        self.push_display()
+
+    def on_contrast(self):
+        if getattr(self, '_atten_job', None):          # same throttle as the brightness sliders
+            self.root.after_cancel(self._atten_job)
+        self._atten_job = self.root.after(50, self.push_display)
+
     def push_display(self):
         self._atten_job = None
         d = self.s['display']
         d['atten'] = [max(0, min(100, int(v.get()))) / 100.0 for v in self.atten_vars]
+        d['contrast'] = max(-100, min(100, int(self.contrast.get())))
+        d['boost'] = [max(0.2, min(10.0, round(float(v.get()), 2))) for v in self.boost_vars]
+        d['lcontrast'] = [max(-100, min(100, int(v.get()))) for v in self.lcon_vars]
         d['auto_bright'] = self.auto_bright.get()
+        d['balance'] = self.balance.get()
         d['gain'] = float(self.gain.get())
         for i, b in enumerate(self.swatches):
             b.configure(bg=hexcol(d['colors'][i]), activebackground=hexcol(d['colors'][i]))
@@ -866,6 +1115,24 @@ class App(object):
         self.btn_hidesnap.pack(side='left')
         self.snap_reason = self._reason(f)
         self.snap_reason.pack(anchor='w')
+        # overlay: lay the snapshot over the live picture, so a beam you snapped
+        # (and then turned off) stays on screen to line the next colour up with
+        r = ttk.Frame(f)
+        r.pack(fill='x', pady=(2, 0))
+        self.overlay_on = tk.BooleanVar(value=False)
+        self.chk_overlay = ttk.Checkbutton(r, text='Overlay on live', variable=self.overlay_on,
+                                           command=self.on_overlay)
+        self.chk_overlay.pack(side='left')
+        self.overlay_amt = tk.IntVar(value=int(self.s.get('overlay_strength', 100)))
+        self.scale_overlay = ttk.Scale(r, from_=10, to=100, orient='horizontal', length=110,
+                                       value=self.overlay_amt.get(),
+                                       command=lambda v: self.on_overlay())
+        self.scale_overlay.pack(side='left', padx=(6, 2))
+        self._on_right_reset(self.scale_overlay, lambda: (self.scale_overlay.set(100), self.on_overlay()))
+        self.overlay_label = ttk.Label(r, text='%d %%' % self.overlay_amt.get(), width=5)
+        self.overlay_label.pack(side='left')
+        self.overlay_reason = self._reason(f)
+        self.overlay_reason.pack(anchor='w')
         self.snap_info = ttk.Label(f, text='Saved snapshots appear next to the live view.',
                                    style='Dim.TLabel', wraplength=290)
         self.snap_info.pack(anchor='w')
@@ -908,16 +1175,25 @@ class App(object):
         self._draw_text_block(annotated, self._snap_lines(meta))      # numbers in the shared PNG too
         annotated.save(path)
         clean.save(path[:-4] + '_raw.png')
+        # the zoomed-in window at full resolution (so the snapshot is as sharp as live)
+        det = msg.get('detail')
+        detail = None
+        if det:
+            detail = {'img': Image.fromarray(det['img']).convert('RGB'), 'box': list(det['box']),
+                      'step': det['step']}
+            detail['img'].save(path[:-4] + '_detail.png')
         meta.update({'time': stamp, 'camera': self.cam_name, 'serial': self.serial,
                      'step': msg['step'], 'shape': list(res['shape']),
                      'crosshair_px': self.s.get('crosshair_px'),
                      'cx_px': res.get('cx_px'), 'cy_px': res.get('cy_px'),
                      'marks': [[list(xy), list(col)] for xy, col in self._live_marks(res)],
                      'boxes': [list(b) for b in (res.get('laser_box') or []) if b],
-                     'view': list(self._view) if self._view else None})
+                     'view': list(self._view) if self._view else None,
+                     'detail_box': detail['box'] if detail else None,
+                     'detail_step': detail['step'] if detail else None})
         with open(path[:-4] + '.json', 'w') as fh:
             json.dump(meta, fh, indent=1)
-        self.show_snapshot(clean.convert('RGB'), meta, path)
+        self.show_snapshot(clean.convert('RGB'), meta, path, detail)
 
     def open_snapshot(self):
         path = filedialog.askopenfilename(initialdir=S.SNAP_DIR, title='Open a beam snapshot',
@@ -936,10 +1212,18 @@ class App(object):
         if not os.path.exists(raw):          # older snapshot: only the annotated picture exists
             raw = path
             meta['marks'] = []
-        self.show_snapshot(Image.open(raw).convert('RGB'), meta, path)
+        detail = None
+        dpath = path[:-4] + '_detail.png'
+        if meta.get('detail_box') and os.path.exists(dpath):
+            try:
+                detail = {'img': Image.open(dpath).convert('RGB'), 'box': list(meta['detail_box']),
+                          'step': int(meta.get('detail_step') or 1)}
+            except OSError:
+                detail = None
+        self.show_snapshot(Image.open(raw).convert('RGB'), meta, path, detail)
 
-    def show_snapshot(self, img, meta, path):
-        self.snapshot = {'img': img, 'meta': meta, 'path': path}
+    def show_snapshot(self, img, meta, path, detail=None):
+        self.snapshot = {'img': img, 'meta': meta, 'path': path, 'detail': detail}
         if not self.snapc.winfo_ismapped():
             self.snapc.pack(side='left', fill='both', expand=True, padx=(2, 4), pady=4)
         txt = os.path.basename(path)
@@ -994,9 +1278,33 @@ class App(object):
         self.draw_snapshot()
         return 'break'
 
+    def on_overlay(self):
+        v = int(round(float(self.scale_overlay.get())))
+        self.overlay_amt.set(v)
+        self.overlay_label.configure(text='%d %%' % v)
+        self._refresh_blocked()
+        if self.last:
+            self.draw_views(self.last)
+
+    def _overlay_problem(self, res):
+        """Why the snapshot cannot be laid over this live picture, or None."""
+        if not self.snapshot:
+            return 'Save or open a snapshot to overlay it.'
+        if res is None:
+            return None
+        sh = self.snapshot['meta'].get('shape')
+        if sh and (abs(sh[0] - res['shape'][0]) > 2 or abs(sh[1] - res['shape'][1]) > 2):
+            return 'This snapshot is from a different sensor size (%dx%d, live %dx%d); not overlaid.' % (
+                sh[1], sh[0], res['shape'][1], res['shape'][0])
+        return None
+
+    def _overlay_active(self, res):
+        return bool(self.overlay_on.get()) and self._overlay_problem(res) is None
+
     def hide_snapshot(self):
         self.snapshot = None
         self._snap_view = None
+        self.overlay_on.set(False)
         self.snapc.pack_forget()
         self.snap_info.configure(text='Saved snapshots appear next to the live view.')
         self._refresh_blocked()
@@ -1009,9 +1317,11 @@ class App(object):
         if self._snap_view is None:
             self._snap_view = self._snapshot_fixed_view(img, meta)
         h, w = self._snap_shape(img, meta)
-        self._render(self.snapc, 'snap', img, meta.get('step', 1), self._snap_view,
+        pic, step, origin = pick_detail(self._snap_view, img, meta.get('step', 1), self.snapshot.get('detail'))
+        self._render(self.snapc, 'snap', pic, step, self._snap_view,
                      [(tuple(xy), col) for xy, col in meta.get('marks', [])],
-                     zlabel=w / self._snap_view[2], shape=(h, w), text=self._snap_lines(meta))
+                     zlabel=w / self._snap_view[2], shape=(h, w), text=self._snap_lines(meta),
+                     origin=origin)
 
     # ---------------------------------------------------------------- power
     def _build_power(self, p):
@@ -1103,7 +1413,8 @@ class App(object):
 
     def push_response(self):
         resp, idx = S.response_matrix(self.s, self.serial)
-        self.send_set({'response': resp, 'laser_idx': idx})
+        self.send_set({'response': resp, 'laser_idx': idx, 'colour_sig': self._colour_sigs()})
+        self._update_learn_labels()
 
     # ---------------------------------------------------------------- optics
     def _build_optics(self, p):
@@ -1195,7 +1506,7 @@ class App(object):
                   'dens_point'):
             v = res.get(k)
             out[k] = None if v is None or (isinstance(v, float) and math.isnan(v)) else v
-        out['peak_pct'] = 100.0 * max(res.get('peak_raw', (0,))) / 255.0
+        out['peak_pct'] = 100.0 * max(res.get('peak_raw', (0,))) / res.get('full', 255.0)
         out['cx_px'], out['cy_px'] = res.get('cx_px'), res.get('cy_px')
         out['avg_frames'] = (res.get('avg') or (None,))[0]
         for i, d in enumerate(self._laser_divs(res)):
@@ -1239,6 +1550,19 @@ class App(object):
              self.cross_reason)
         gate(self.btn_snap, None if self.last else 'Connect a camera first.', self.snap_reason)
         gate(self.btn_hidesnap, None if self.snapshot else 'No snapshot shown')
+        if self._learning is not None:
+            lr = 'Learning the %s laser...' % S.LASERS[self._learning[0]]
+        elif not has_frame:
+            lr = 'Connect the camera and turn ONE laser on to learn its colour.'
+        else:
+            lr = None
+        for b in self.learn_btns:
+            gate(b, lr)
+        if lr or not self.learn_reason.cget('text').startswith(('No ', 'The sensor', 'Note:')):
+            self.learn_reason.configure(text=lr or '')
+        gate(self.btn_forget, None if any(self._colour_sigs()) else 'Nothing learned yet')
+        prob = self._overlay_problem(self.last['result'] if self.last else None)
+        gate(self.chk_overlay, prob, self.overlay_reason)
         gate(self.btn_zero, None if connected and self.calibrating is None else 'Connect first')
         gate(self.btn_log, None if (connected or self.csv_file) else 'Connect a camera first.', self.log_reason)
         reason = None
@@ -1246,8 +1570,8 @@ class App(object):
             reason = 'Connect the LBA (or the simulator) to calibrate.'
         elif self.calibrating is not None:
             reason = 'Calibrating the %s laser...' % S.LASERS[self.calibrating]
-        elif self.auto_exp.get():
-            reason = 'Turn Auto exposure off first: the exposure must stay fixed while calibrating.'
+        # (auto exposure needs no turning off: the camera process holds the exposure
+        # still while it calibrates or zeroes, then auto exposure carries on)
         for i, b in enumerate(self.pw_buttons):
             r = reason
             if r is None:
@@ -1274,6 +1598,8 @@ class App(object):
         s['stack'] = int(self.stack.get())
         s['auto_roi'] = self.auto_roi.get()
         s['show_crosshair'] = self.show_cross.get()
+        s['spot'] = self.spot_key()
+        s['overlay_strength'] = int(self.overlay_amt.get())
         s['show_profiles'] = self.show_profiles.get()
         s['zoom'] = float(self.zoom.get())
         s['zoom_follow'] = self.zoom_follow.get()
@@ -1302,11 +1628,15 @@ class App(object):
                'auto_exposure': s['auto_exposure'], 'stack': s['stack'], 'auto_roi': s['auto_roi'],
                'roi': s.get('roi'),
                'optics': s['optics'], 'display': s['display'], 'zero_px': s.get('crosshair_px'),
-               'response': None, 'laser_idx': [], 'ae_target': s.get('ae_target', 0.85)}
+               'response': None, 'laser_idx': [], 'ae_target': s.get('ae_target', 0.85),
+               'spot': s.get('spot', 'right')}
         self.cmd_q = mp.Queue()
         self.out_q = mp.Queue(maxsize=3)
         self.proc = mp.Process(target=worker.run, args=(self.cmd_q, self.out_q, cfg), daemon=True)
         self.proc.start()
+        self._frame_no, self._last_frame_t, self._stall_reported = 0, None, False
+        self._detail_req = None          # a new camera process has no zoom window yet
+        log_error('Connect: backend %s, BeamLab %s' % (s['backend'], __version__))
         self.status.configure(text='Opening camera...')
         self._refresh_blocked()
 
@@ -1336,6 +1666,71 @@ class App(object):
             self.cmd_q.put(('set', d))
 
     def poll(self):
+        """Every 15 ms: take new messages from the camera process and draw. This loop
+        must never stop (one uncaught error used to freeze the picture for good while
+        the rest of the window kept working), so errors are logged + shown instead."""
+        try:
+            self._poll_body()
+            self._watchdog()
+        except Exception:  # noqa: BLE001
+            self._on_tk_error(*sys.exc_info())
+        finally:
+            try:
+                self.root.after(15, self.poll)
+            except tk.TclError:
+                pass                                    # window closed
+
+    def _watchdog(self):
+        """Tell the user when the camera process died or stopped sending pictures."""
+        if not self.proc:
+            return
+        now = time.time()
+        if not self.proc.is_alive():
+            code = self.proc.exitcode
+            self.proc = None
+            self.serial = None
+            msg = ('The camera process stopped unexpectedly (exit code %s).' % code)
+            log_error(msg + ' Last frame #%d.' % self._frame_no)
+            self.status.configure(text=msg)
+            self._refresh_blocked()
+            if messagebox.askyesno('Camera', msg + '\n\nDetails (if any) are in\n%s\n\nReconnect now?'
+                                   % S.ERROR_LOG):
+                self.disconnect()
+                self.connect()
+            return
+        if self._last_frame_t is None:
+            return
+        exp_s = max(self.s.get('exposure_us', 5000.0), 1.0) / 1e6
+        limit = max(5.0, 8 * exp_s * max(1, int(self.stack.get())))
+        stalled = now - self._last_frame_t > limit
+        if stalled and not self._stall_reported:
+            self._stall_reported = True
+            msg = 'No new picture from the camera for %.0f s (frame #%d).' % (now - self._last_frame_t, self._frame_no)
+            log_error(msg + ' Camera process alive: yes.')
+            self.status.configure(text=msg + ' Disconnect + Connect restarts it.')
+        elif not stalled and self._stall_reported:
+            self._stall_reported = False
+            log_error('Pictures resumed at frame #%d.' % self._frame_no)
+
+    def _on_tk_error(self, exc, val, tb):
+        """Any error in the window: write the full traceback to errors.log and say so
+        (once per distinct error, so a per-frame error does not flood pop-ups)."""
+        import traceback
+        text = ''.join(traceback.format_exception(exc, val, tb))
+        log_error('Window error:\n' + text)
+        key = (exc.__name__, str(val)[:120])
+        if key in self._errors_shown:
+            return
+        self._errors_shown.add(key)
+        try:
+            self.status.configure(text='Error: %s: %s (details in %s)' % (exc.__name__, val, S.ERROR_LOG))
+            messagebox.showerror('BeamLab error', '%s: %s\n\nThe full details were saved to\n%s\n\n'
+                                 'BeamLab keeps running. Please send that file if this repeats.'
+                                 % (exc.__name__, val, S.ERROR_LOG))
+        except tk.TclError:
+            pass
+
+    def _poll_body(self):
         latest = None
         if self.out_q is not None:
             for _ in range(10):
@@ -1358,12 +1753,21 @@ class App(object):
         if latest is not None:
             first = self.last is None
             self.last = latest
+            self._frame_no += 1
+            self._last_frame_t = time.time()
             self.draw(latest)
-            if first or latest.get('calibrating') != (self.calibrating is not None):
+            # re-check the buttons whenever "a beam is seen" changes: buttons that need
+            # a beam (Learn, crosshair Snap) used to stay grey for good when the first
+            # frame had none (laser turned on after connecting, auto exposure settling)
+            beam = bool(latest['result'].get('ok'))
+            if (first or beam != getattr(self, '_beam_seen', None)
+                    or latest.get('calibrating') != (self.calibrating is not None)):
+                self._beam_seen = beam
                 self._refresh_blocked()
             if first:
                 self._update_cross_info()        # now the sensor size is known
-        self.root.after(15, self.poll)
+            if not self._stall_reported:
+                self.status.configure(text='Streaming: frame #%d, %.1f fps' % (self._frame_no, latest.get('fps', 0)))
 
     def on_opened(self, m):
         self.serial = m['serial']
@@ -1371,7 +1775,10 @@ class App(object):
         lo, hi = m['exposure_range']
         self.exposure_range = (float(lo), float(min(hi, MAX_EXPOSURE_US)))
         self._exp_range_text()
-        self.cam_info.configure(text='%s\nmodel %s, serial %s' % (m['name'], m['model'], m['serial']))
+        fmt_ = m.get('pixel_format') or ''
+        bits = '12-bit' if fmt_.endswith('12') else '8-bit'
+        self.cam_info.configure(text='%s\nmodel %s, serial %s\n%s raw pixels (%s)'
+                                % (m['name'], m['model'], m['serial'], bits, fmt_))
         self.status.configure(text='Streaming.')
         self._set_exp_widgets(self.s['exposure_us'])
         self.push_response()
@@ -1433,17 +1840,21 @@ class App(object):
         for i, s in enumerate(lines):
             d.text((x + 5, y + 3 + i * lh), s, fill=(235, 235, 235), font=font)
 
-    def _render(self, canvas, key, img, step, view, marks, zlabel=None, shape=None, text=None):
-        """Show the `view` window (analysis px) of `img` (preview px = analysis px / step)
-        fitted to `canvas`, with the crosshair and per-laser marks drawn on top.
-        marks = [((x, y) analysis px, (r, g, b)), ...]"""
+    def _render(self, canvas, key, img, step, view, marks, zlabel=None, shape=None, text=None,
+                origin=(0, 0)):
+        """Show the `view` window (analysis px) of `img` (preview px = analysis px / step;
+        `img` starts at `origin` on the sensor, analysis px) fitted to `canvas`, with the
+        crosshair and per-laser marks drawn on top.
+        marks = [((x, y) analysis px, (r, g, b)[, 'ring']), ...]"""
         x0, y0, vw, vh = view
         cw, ch = max(canvas.winfo_width(), 50), max(canvas.winfo_height(), 50)
         sc = min(cw / vw, ch / vh)                          # display px per analysis px
         W, H = max(1, int(vw * sc)), max(1, int(vh * sc))
-        box = (x0 / step, y0 / step, (x0 + vw) / step, (y0 + vh) / step)
-        resample = Image.NEAREST if sc / step >= 2 else Image.BILINEAR   # show real pixels when zoomed
-        im = img.resize((W, H), resample, box=box)
+        ox0, oy0 = origin
+        box = ((x0 - ox0) / step, (y0 - oy0) / step, (x0 + vw - ox0) / step, (y0 + vh - oy0) / step)
+        # smooth at every zoom (a switch to sharp blocks used to kick in at ~10x);
+        # bicubic: zoomed far in, bilinear still shows the facets between pixels
+        im = img.resize((W, H), Image.BICUBIC, box=box)
         d = ImageDraw.Draw(im)
 
         def T(x, y):
@@ -1457,8 +1868,12 @@ class App(object):
             d.line([(cx, 0), (cx, H)], fill=(255, 255, 255), width=1)
             rr = max(12, 0.5 * sc)
             d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], outline=(255, 255, 255))
-        for xy, col in marks:
+        for m in marks:
+            xy, col = m[0], m[1]
             x, y = T(*xy)
+            if len(m) > 2 and m[2] == 'ring':       # a snapshot's spot centre (overlay)
+                d.ellipse([x - 9, y - 9, x + 9, y + 9], outline=tuple(col), width=2)
+                continue
             d.line([(x - 8, y - 8), (x + 8, y + 8)], fill=tuple(col), width=2)
             d.line([(x - 8, y + 8), (x + 8, y - 8)], fill=tuple(col), width=2)
         z = self.zoom.get() if zlabel is None else zlabel
@@ -1477,6 +1892,34 @@ class App(object):
         canvas._img = tkimg            # keep a reference or Tk drops the image
         self._geom[key] = (ox, oy, sc, x0, y0)
 
+    def _request_detail(self, shape):
+        """Ask the camera process for the zoomed-in window at full resolution: the
+        view plus a margin (so a beam-following zoom does not need a new one every
+        frame). Re-sent only when the view leaves it or the zoom changes a lot."""
+        H, W = shape
+        x0, y0, vw, vh = self._view
+        want = None
+        if vw < 0.6 * W:                                    # zoomed in enough to matter
+            # a wide margin (up to one view each side) so zooming in further, or the
+            # beam-follow drifting, still finds full detail until the next frame;
+            # capped so the window stays <= 960 px and is sent at full resolution
+            k = max(0.1, min(1.0, (worker.PREVIEW_MAX_W - 2.0 - vw) / (2.0 * vw)))
+            mx, my = k * vw, k * vh
+            want = [max(0.0, x0 - mx), max(0.0, y0 - my), min(float(W), x0 + vw + mx), min(float(H), y0 + vh + my)]
+        cur = getattr(self, '_detail_req', None)
+        if want is None:
+            if cur is not None:
+                self._detail_req = None
+                self.send_set({'detail_view': None})
+            return
+        if cur is not None:
+            inside = cur[0] <= x0 and cur[1] <= y0 and x0 + vw <= cur[2] and y0 + vh <= cur[3]
+            size_ok = 0.7 < (cur[2] - cur[0]) / max(want[2] - want[0], 1e-6) < 1.4
+            if inside and size_ok:
+                return
+        self._detail_req = want
+        self.send_set({'detail_view': want})
+
     def _live_marks(self, res):
         out = []
         if res and res.get('ok'):
@@ -1489,8 +1932,20 @@ class App(object):
     def draw_views(self, msg):
         res = msg['result']
         self._view = self._compute_view(res['shape'], res)
-        self._render(self.live, 'live', Image.fromarray(msg['preview']), msg['step'], self._view,
-                     self._live_marks(res))
+        self._request_detail(res['shape'])
+        live, step, origin = pick_detail(self._view, msg['preview'], msg['step'], msg.get('detail'))
+        marks = self._live_marks(res)
+        if self._overlay_active(res):
+            h, w = live.shape[:2]
+            area = (origin[0], origin[1], origin[0] + w * step, origin[1] + h * step)
+            sd = self.snapshot.get('detail')
+            # the snapshot's own full-resolution window when it covers this area
+            snap, ss, so = pick_detail((area[0], area[1], area[2] - area[0], area[3] - area[1]),
+                                       self.snapshot['img'], self.snapshot['meta'].get('step', 1), sd)
+            region = ((area[0] - so[0]) / ss, (area[1] - so[1]) / ss, (area[2] - so[0]) / ss, (area[3] - so[1]) / ss)
+            live = overlay_snapshot(live, snap, self.overlay_amt.get() / 100.0, region)
+            marks = [(tuple(xy), col, 'ring') for xy, col in self.snapshot['meta'].get('marks', [])] + marks
+        self._render(self.live, 'live', Image.fromarray(live), step, self._view, marks, origin=origin)
         if self.snapshot:
             self.draw_snapshot()
         self.live.delete('hud')
@@ -1522,6 +1977,7 @@ class App(object):
     def draw(self, msg):
         res = msg['result']
         self.draw_views(msg)
+        self._learn_frame(res)
         # follow the camera's exposure only when auto exposure drives it; while you
         # drag the slider, the slider is the truth (frames lag the setting)
         if self.auto_exp.get() and not self._dragging:
@@ -1609,7 +2065,7 @@ class App(object):
         res = msg['result']
         t = self.readout
         t.delete('1.0', 'end')
-        peak = 100.0 * max(res['peak_raw']) / 255.0
+        peak = 100.0 * max(res['peak_raw']) / res.get('full', 255.0)
         t.insert('end', 'Exposure %s   peak %.0f %%   %.0f fps' %
                  (('%.2f ms' % (res['exposure_us'] / 1000)), peak, msg['fps']), 'dim')
         if msg.get('temp') is not None:
@@ -1618,6 +2074,10 @@ class App(object):
         if st and st != 'off':
             t.insert('end', '   auto: %s' % st, 'good' if st == 'settled' else 'dim')
         t.insert('end', '\n')
+        ns = res.get('n_spots') or 0
+        if ns > 1:
+            t.insert('end', '%d spots seen: measuring the %s\n'
+                     % (ns, self.SPOT_NAMES.get(self.spot_key(), 'right spot').lower()), 'dim')
         if st == 'at_min':
             t.insert('end', 'Shortest exposure and still too bright:\n'
                      '  add an ND filter or lower the laser power\n', 'bad')

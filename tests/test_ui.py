@@ -1,6 +1,7 @@
 """UI checks with the real window and simulated frames (no worker process).
 Run: python tests/test_ui.py      (opens and closes a window briefly)"""
 import os
+import queue
 import sys
 import tempfile
 import time
@@ -9,6 +10,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import tempfile  # noqa: E402
+os.environ.setdefault('BEAMLAB_DIR', tempfile.mkdtemp(prefix='beamlab_test_'))  # never touch the real settings/logs
 from beamlab import analysis, settings, worker  # noqa: E402
 from beamlab.cameras import SimCamera  # noqa: E402
 
@@ -17,6 +20,7 @@ _tmp = tempfile.mkdtemp(prefix='beamlab_ui_')
 settings.DIR = _tmp
 settings.FILE = os.path.join(_tmp, 'settings.json')
 settings.SNAP_DIR = os.path.join(_tmp, 'snapshots')
+settings.ERROR_LOG = os.path.join(_tmp, 'errors.log')
 
 import tkinter as tk  # noqa: E402
 from beamlab import app as A  # noqa: E402
@@ -154,6 +158,228 @@ def main():
     x, y, xm, ym = app.cross_coords()
     check(abs(x - (tx - W / 2.0)) < 0.5 and abs(y - (H / 2.0 - ty)) < 0.5 and (xm > 0) == (x > 0),
           'crosshair coordinates are relative to the sensor centre, +y up (%.1f, %.1f px)' % (x, y))
+    # ---- snapshot overlay: the snapped beam stays on the live view after the laser is off
+    app.hide_snapshot()
+    check(app.chk_overlay.instate(['disabled']) and app.overlay_reason.cget('text'),
+          'Overlay on live is greyed out (with a reason) until there is a snapshot')
+    app.save_snapshot()
+    pump(root, 0.1)
+    check(not app.chk_overlay.instate(['disabled']), 'Overlay on live is available once a snapshot is shown')
+    seen = {}
+    orig_render = app._render
+
+    def spy(canvas, key, img, step, view, marks, **kw):
+        if key == 'live':
+            seen['img'], seen['marks'] = np.asarray(img), list(marks)
+        return orig_render(canvas, key, img, step, view, marks, **kw)
+    app._render = spy
+    dark = dict(msg, preview=np.zeros_like(msg['preview']))          # all lasers now off
+    app.draw_views(dark)
+    check(seen['img'].max() == 0, 'overlay off: the live view is dark with the lasers off')
+    app.overlay_on.set(True)
+    app.on_overlay()
+    app.draw_views(dark)
+    check(seen['img'].max() > 200 and abs(int(seen['img'].sum()) - int(msg['preview'].sum())) < 0.02 * msg['preview'].sum(),
+          'overlay on: the snapped beams show on the live view')
+    check(sum(1 for m in seen['marks'] if len(m) > 2 and m[2] == 'ring') == len(app.snapshot['meta']['marks']) > 0,
+          'overlay on: each snapped laser centre is drawn as a ring')
+    app.scale_overlay.set(50)
+    app.on_overlay()
+    app.draw_views(dark)
+    check(100 < seen['img'].max() < 140, 'overlay strength 50 %% dims the snapshot (peak %d)' % seen['img'].max())
+    app.draw_views(msg)                                              # live beams on again
+    check(seen['img'].max() == 255, 'live beams stay at full brightness under the overlay')
+    app.hide_snapshot()
+    app.draw_views(dark)
+    check(not app.overlay_on.get() and seen['img'].max() == 0, 'Hide snapshot also ends the overlay')
+    app._render = orig_render
+    app.scale_overlay.set(100)
+    app.on_overlay()
+    # ---- contrast slider reaches the display settings sent to the camera process
+    sent = []
+    orig_send = app.send_set
+    app.send_set = lambda d: sent.append(d)
+    app.contrast.set(-40)
+    app.on_contrast()
+    pump(root, 0.15)
+    check(sent and sent[-1]['display'].get('contrast') == -40, 'Contrast slider is sent with the display settings')
+    app.contrast.set(0)
+    app.on_contrast()
+    pump(root, 0.15)
+    # ---- per-laser boost and contrast sliders
+    check(len(app.boost_vars) == 3 and len(app.lcon_vars) == 3, 'each laser has its own Boost and Contrast slider')
+    app.boost_vars[1].set(2.5)
+    app.on_laser_tone(app.boost_vars[1], app.boost_labels[1], '%.1fx')
+    app.lcon_vars[2].set(-30)
+    app.on_laser_tone(app.lcon_vars[2], app.lcon_labels[2], '%+d')
+    pump(root, 0.15)
+    d = sent[-1]['display'] if sent else {}
+    check(d.get('boost') == [1.0, 2.5, 1.0] and d.get('lcontrast') == [0, 0, -30]
+          and app.boost_labels[1].cget('text') == '2.5x',
+          'per-laser Boost / Contrast are sent with the display settings (%s, %s)' % (d.get('boost'), d.get('lcontrast')))
+    app.reset_laser_tone()
+    d = sent[-1]['display']
+    check(d['boost'] == [1.0, 1.0, 1.0] and d['lcontrast'] == [0, 0, 0] and d['atten'] == [1.0, 1.0, 1.0],
+          'Reset puts every laser back to 100 %, 1.0x, +0')
+    # ---- buttons that need a beam come alive when the beam appears AFTER connecting
+    #      (Jon: Learn and crosshair Snap stayed grey with the laser on)
+    class _Alive(object):
+        def is_alive(self):
+            return True
+        exitcode = None
+    saved = (app.proc, app.out_q, app.last, app.send_set)
+    app.proc, app.out_q, app.last = _Alive(), queue.Queue(), None
+    app.send_set = lambda d: None
+    real = dict(msg, calibrating=False)                          # as the camera process sends them
+    app.out_q.put(dict(real, result=dict(res, ok=False)))        # first frame: laser still off
+    app._poll_body()
+    grey = app.learn_btns[0].instate(['disabled']) and app.btn_snapcross.instate(['disabled'])
+    app.out_q.put(real)                                          # laser turned on
+    app._poll_body()
+    check(grey and not app.learn_btns[0].instate(['disabled']) and not app.btn_snapcross.instate(['disabled']),
+          'Learn and crosshair Snap come alive when a beam appears after connecting')
+    app.out_q.put(dict(real, result=dict(res, ok=False)))        # laser off again
+    app._poll_body()
+    check(app.learn_btns[0].instate(['disabled']) and app.btn_snapcross.instate(['disabled']),
+          'and grey out again (with a reason) when the beam goes away')
+    app.proc, app.out_q, app.last, app.send_set = saved
+    app._beam_seen = None
+    app._refresh_blocked()
+    # ---- Calibrate works with Auto exposure ON (the camera process holds the exposure)
+    saved_proc = app.proc
+    app.proc = type('P', (), {'is_alive': lambda self: True, 'exitcode': None})()
+    app.auto_exp.set(True)
+    app.pw_entries[0].delete(0, 'end')
+    app.pw_entries[0].insert(0, '0.5')
+    app._refresh_blocked()
+    check(not app.pw_buttons[0].instate(['disabled']) and 'Auto exposure' not in app.pw_reason.cget('text'),
+          'Calibrate is available with Auto exposure on (no "turn it off first")')
+    app.pw_entries[0].delete(0, 'end')
+    app.proc = saved_proc
+    app._refresh_blocked()
+    # ---- control panels in Jon's order, top to bottom
+    root.update_idletasks()
+    boxes = sorted(app._boxes.items(), key=lambda kv: kv[1].winfo_y())
+    order = [t.split(' (')[0].replace('Display colours', 'Colours') for t, _ in boxes]
+    check(order == ['Camera', 'Crosshair', 'View', 'Exposure', 'Colours', 'Snapshot', 'Optics',
+                    'Power calibration', 'Log measurements'],
+          'control panels top to bottom: %s' % ', '.join(order))
+    # ---- which spot is measured (the LBA shows 3)
+    sent_spot = []
+    orig_send2 = app.send_set
+    app.send_set = lambda d: sent_spot.append(d)
+    check(app.spot.get() == 'Right spot', 'Measure defaults to the right spot')
+    app.spot.set('Left spot')
+    app.on_spot()
+    check(sent_spot and sent_spot[-1] == {'spot': 'left'} and app._collect()['spot'] == 'left',
+          'choosing Left spot is sent to the camera process and saved')
+    app.draw_readout(dict(msg, result=dict(res, n_spots=3)))
+    check('3 spots seen: measuring the left spot' in app.readout.get('1.0', 'end'),
+          'the readout says how many spots there are and which one is measured')
+    app.spot.set('Right spot')
+    app.on_spot()
+    app.send_set = orig_send2
+    # ---- right-click a slider = its default
+    app.boost_vars[0].set(3.0)
+    app.gain.set(4.0)
+    sc_boost = next(w for w, fn in app._reset_fns if isinstance(w, tk.Scale) and str(w.cget('variable')) == str(app.boost_vars[0]))
+    sc_gain = next(w for w, fn in app._reset_fns if isinstance(w, tk.Scale) and str(w.cget('variable')) == str(app.gain))
+    for w_ in (sc_boost, sc_gain):
+        w_.event_generate('<Button-3>', x=5, y=5)
+    pump(root, 0.15)
+    check(abs(app.boost_vars[0].get() - 1.0) < 1e-9 and abs(app.gain.get() - 1.0) < 1e-9,
+          'right-click puts a slider back to its default (boost %.1f, master boost %.1f)'
+          % (app.boost_vars[0].get(), app.gain.get()))
+    check(len(app._reset_fns) >= 15, 'every slider has a right-click reset (%d)' % len(app._reset_fns))
+    # ---- learn a laser's colour (one laser on), saved per camera and sent to the camera process
+    sent.clear()
+    app.learn_colour(1)
+    for _ in range(app.LEARN_FRAMES):
+        app._learn_frame(dict(res, ok=True, peak_raw=[60, 200, 90], rates=[8.0, 100.0, 30.0]))
+    sig = app._colour_sigs()[1]
+    check(sig == [0.08, 1.0, 0.3] and app.learn_labels[1].cget('text') == 'learned',
+          'Learn stores the laser colour as seen by the camera (%s)' % (sig,))
+    cs = [d['colour_sig'] for d in sent if 'colour_sig' in d]
+    check(cs and cs[-1][1] == [0.08, 1.0, 0.3], 'learned colour is sent to the camera process')
+    app.learn_colour(0)
+    app._learn_frame(dict(res, ok=True, peak_raw=[255, 40, 20], rates=[100.0, 18.0, 6.0]))
+    check(app._learning is None and app._colour_sigs()[0] is None and 'saturated' in app.learn_reason.cget('text'),
+          'Learn refuses a saturated picture and says why')
+    app.learn_colour(2)
+    app._learn_frame(dict(res, ok=False))
+    check(app._colour_sigs()[2] is None and 'No beam' in app.learn_reason.cget('text'),
+          'Learn with no beam says so')
+    app.forget_colours()
+    check(app._colour_sigs() == [None, None, None] and app.btn_forget.instate(['disabled']),
+          'Forget learned colours clears them')
+    # ---- zoomed in: the window asks for the zoomed area at full resolution and draws it
+    frame_msg_saved = msg
+    sent.clear()
+    app.zoom_follow.set('Beam')
+    app.set_zoom(12.0)
+    for _ in range(30):
+        app.draw(msg)
+    reqs = [d['detail_view'] for d in sent if 'detail_view' in d]
+    x0, y0, vw, vh = app._view
+    want = reqs[-1] if reqs else None
+    check(want is not None and want[0] <= x0 and want[1] <= y0 and x0 + vw <= want[2] and y0 + vh <= want[3],
+          'zoomed in: the camera process is asked for the zoomed window (covers the view)')
+    check(len(reqs) <= 4, 'the zoom window is not re-sent every frame while the view holds still (%d)' % len(reqs))
+    # (this test camera is small, so its whole picture is already full resolution;
+    # stand in a window cut from it, as the 4K camera process would send)
+    bx0, by0, bx1, by1 = (int(round(v)) for v in want)
+    det = {'img': msg['preview'][by0:by1, bx0:bx1].copy(), 'box': (bx0, by0, bx1, by1), 'step': 1}
+    msg = dict(msg, step=2, preview=msg['preview'][::2, ::2].copy())    # coarse whole picture, like 4K
+    seen = {}
+
+    def spy2(canvas, key, img, step, view, marks, **kw):
+        if key == 'live':
+            seen['step'], seen['origin'] = step, kw.get('origin')
+        return orig_render(canvas, key, img, step, view, marks, **kw)
+    app._render = spy2
+    app.draw_views(dict(msg, detail=det))
+    check(det is not None and seen.get('step') == det['step'] < msg['step'] and seen.get('origin') == det['box'][:2],
+          'zoomed in: the live view draws the full-resolution window (step %s, was %d)' % (seen.get('step'), msg['step']))
+    vw_now = app._view[2]
+    check(want[2] - want[0] >= 2.5 * vw_now and want[2] - want[0] <= worker.PREVIEW_MAX_W,
+          'zoom window has a wide margin (%.0f px for a %.0f px view) but stays full resolution'
+          % (want[2] - want[0], vw_now))
+    # a snapshot taken zoomed in keeps the full-resolution window (and reopens with it)
+    snaps = {}
+
+    def spy3(canvas, key, img, step, view, marks, **kw):
+        snaps[key] = (step, kw.get('origin'))
+        return orig_render(canvas, key, img, step, view, marks, **kw)
+    app._render = spy3
+    app.last = dict(msg, detail=det)
+    app.save_snapshot()
+    app.draw_snapshot()
+    check(snaps.get('snap') == (1, det['box'][:2]), 'zoomed-in snapshot is drawn from its full-resolution window %s'
+          % (snaps.get('snap'),))
+    p = app.snapshot['path']
+    app.hide_snapshot()
+    orig_ask = A.filedialog.askopenfilename
+    A.filedialog.askopenfilename = lambda **k: p
+    app.open_snapshot()
+    A.filedialog.askopenfilename = orig_ask
+    app.draw_snapshot()
+    check(app.snapshot.get('detail') is not None and snaps.get('snap') == (1, det['box'][:2]),
+          'reopened snapshot is still full resolution')
+    app.hide_snapshot()
+    app.last = frame_msg_saved
+    app._render = spy2
+    app.set_zoom(1.0)
+    for _ in range(30):
+        app.draw(msg)
+    app.draw_views(dict(msg, detail=det))
+    check(seen.get('step') == msg['step'] and sent[-1].get('detail_view', 1) is None,
+          'zoomed out: back to the whole-sensor picture, zoom window cancelled')
+    app._render = orig_render
+    app.send_set = orig_send
+    msg = frame_msg_saved
+    app.set_zoom(4.0)                         # as the checks below expect
+    for _ in range(30):
+        app.draw(msg)
     check(not hasattr(app, 'btn_place'), 'no "Place by click" button any more')
     # ---- auto exposure stays ON while it moves the slider itself
     app.auto_exp.set(True)
@@ -274,6 +500,37 @@ def main():
     app.idle_tick()
     pump(root, 0.3)
     check(not app._fs, 'mouse movement restores the normal GUI')
+    # ---- an error while drawing a frame must not stop the picture (it used to, silently)
+    import queue as _q
+    shown_boxes = []
+    A.messagebox.showerror = lambda *a, **k: shown_boxes.append(a)
+    real_draw = app.draw
+    calls = {'n': 0}
+
+    def flaky_draw(m):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise ValueError('test error in draw')
+        real_draw(m)
+    app.draw = flaky_draw
+    app.out_q = _q.Queue()
+    after_before = len(root.tk.splitlist(root.tk.call('after', 'info')))
+    app.out_q.put(msg)
+    app.poll()
+    check(len(root.tk.splitlist(root.tk.call('after', 'info'))) == after_before + 1,
+          'picture loop keeps running after an error while drawing')
+    log_txt = open(settings.ERROR_LOG, encoding='utf-8').read() if os.path.exists(settings.ERROR_LOG) else ''
+    check('test error in draw' in log_txt and len(shown_boxes) == 1, 'the error is written to errors.log and shown once')
+    n0 = app._frame_no
+    app.out_q.put(msg)
+    app.poll()
+    check(app._frame_no == n0 + 1 and calls['n'] == 2, 'the next frame draws normally')
+    app.out_q.put(msg)
+    app.draw = lambda m: (_ for _ in ()).throw(ValueError('test error in draw'))
+    app.poll()
+    check(len(shown_boxes) == 1, 'the same error again is logged but not shown again')
+    app.draw = real_draw
+    app.out_q = None
     # the idle timer must survive an error inside it (a Combobox popdown used to kill it)
     real_body = app._idle_body
 

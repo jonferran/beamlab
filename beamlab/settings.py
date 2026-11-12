@@ -3,9 +3,26 @@ import copy
 import json
 import os
 
-DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'BeamLab')
+# BEAMLAB_DIR overrides the folder (tests use it; child processes inherit it)
+DIR = os.environ.get('BEAMLAB_DIR') or os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'BeamLab')
 FILE = os.path.join(DIR, 'settings.json')
 SNAP_DIR = os.path.join(DIR, 'snapshots')
+ERROR_LOG = os.path.join(DIR, 'errors.log')
+
+
+def log_error(text):
+    """Append a time-stamped entry to errors.log (window, camera process and crash
+    handler all write here). Kept under ~1 MB: the old half moves to errors.log.1."""
+    import datetime
+    try:
+        os.makedirs(DIR, exist_ok=True)
+        if os.path.exists(ERROR_LOG) and os.path.getsize(ERROR_LOG) > 1000000:
+            os.replace(ERROR_LOG, ERROR_LOG + '.1')
+        with open(ERROR_LOG, 'a', encoding='utf-8') as fh:
+            fh.write('[%s pid %d] %s\n' % (datetime.datetime.now().isoformat(timespec='milliseconds'),
+                                           os.getpid(), text.rstrip()))
+    except OSError:
+        pass
 
 LASERS = ['Red', 'Green', 'Blue']
 
@@ -16,15 +33,23 @@ DEFAULTS = {
     'ae_target': 0.85,
     'stack': 1,
     'auto_roi': True,
+    'spot': 'right',                           # which spot is measured: right|middle|left|brightest
+                                               # (the LBA always shows 3 spots side by side)
     'width_mode': 'fwhm',                      # fwhm | e2 | d4s
     'optics': {'pixel_pitch_um': 3.45, 'focal_mm': 50.0},
     'display': {'colors': [[255, 0, 0], [0, 255, 0], [0, 80, 255]],
                 'auto_bright': True, 'gain': 1.0, 'roi_color': [0, 255, 0],
-                'atten': [1.0, 1.0, 1.0]},             # per-laser on-screen brightness 0..1
+                'atten': [1.0, 1.0, 1.0],              # per-laser on-screen brightness 0..1
+                'contrast': 0,                         # -100..100, display gamma 2^(c/50)
+                'balance': True,                       # each laser's peak at full brightness
+                'boost': [1.0, 1.0, 1.0],              # per-laser boost (x)
+                'lcontrast': [0, 0, 0]},               # per-laser contrast -100..100
     'crosshair_px': None,                      # analysis px; None = image centre
     'show_crosshair': True,
+    'overlay_strength': 100,                   # snapshot overlay on live, %
     'wavelengths_nm': [638, 520, 450],
     'calibrations': {},                        # serial -> {'response': 3x3 (None columns), 'date': str}
+    'colour_sigs': {},                         # serial -> per laser learned [r, g, b] (display only)
     'csv_dir': os.path.join(os.path.expanduser('~'), 'Documents'),
 }
 

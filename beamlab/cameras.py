@@ -1,8 +1,10 @@
-"""Camera backends. Each returns raw BayerGR8 frames as uint8 numpy arrays.
+"""Camera backends. Each returns raw frames in BayerGR layout as numpy arrays:
+uint16 0..4095 from a 12-bit camera, uint8 0..255 from an 8-bit one; the
+camera's `full` (4095.0 or 255.0) is the saturation level every check uses.
 
 The LBA-C-100 contains either a Basler (pylon) or an Imaging Source (IC4)
 USB3 Vision colour camera. BeamLab uses the vendors' official Python packages,
-sets PixelFormat=BayerGR8, turns ExposureAuto/GainAuto off and turns Basler's
+sets a raw Bayer pixel format (12-bit if offered), turns ExposureAuto/GainAuto off and turns Basler's
 colour space / light-source presets off (raw, linear pixel values):
     pip install pypylon            (Basler)
     pip install imagingcontrol4    (The Imaging Source)
@@ -27,12 +29,15 @@ class Camera(object):
     serial = ''
     model = ''
     exposure_range = (20.0, 1000000.0)   # microseconds
+    full = 255.0                         # saturation level of the raw values (4095 for 12-bit)
+    bayer = 'BayerGR8'
 
     def set_exposure(self, us):
         raise NotImplementedError
 
     def grab(self):
-        """-> (raw uint8 HxW BayerGR8, exposure_us actually used, temperature_C or None)"""
+        """-> (raw HxW BayerGR layout, uint8 or uint16 up to self.full,
+        exposure_us actually used, temperature_C or None)"""
         raise NotImplementedError
 
     def close(self):
@@ -45,6 +50,37 @@ def _try(fn, *a):
         return True
     except Exception:
         return False
+
+
+# The analysis expects the BayerGR layout. Cameras that only offer another Bayer
+# order (the LBA's Basler daA3840-45uc is BayerRG only) are converted by
+# dropping the first and last column and/or row: that shifts the colour phase
+# by one pixel and keeps the sensor centre exactly where it was.
+BAYER_ORDERS_8 = ('BayerGR8', 'BayerRG8', 'BayerGB8', 'BayerBG8')
+# 12-bit first: 16x finer steps, so a dim beam (the LBA's reaches ~50 of 255 at the
+# longest exposure) is no longer a few coarse levels that turn grainy when boosted.
+# Unpacked 12-bit (two bytes per pixel); the packed '12p' formats are not used.
+BAYER_ORDERS_12 = ('BayerGR12', 'BayerRG12', 'BayerGB12', 'BayerBG12')
+BAYER_ORDERS = BAYER_ORDERS_12 + BAYER_ORDERS_8
+
+
+def bayer_full(order):
+    """Saturation level of a pixel format: 4095 (12-bit) or 255 (8-bit)."""
+    return 4095.0 if order.endswith('12') else 255.0
+
+
+def to_gr8(raw, order):
+    """raw Bayer frame in `order` (8 or 12 bit) -> BayerGR layout (G R / B G)."""
+    phase = order[:7]                    # 'BayerGR' / 'BayerRG' / ...
+    if phase == 'BayerGR':
+        return raw
+    if phase == 'BayerRG':               # R G / G B: shift one column
+        return raw[:, 1:-1]
+    if phase == 'BayerBG':               # B G / G R: shift one row
+        return raw[1:-1, :]
+    if phase == 'BayerGB':               # G B / R G: shift row and column
+        return raw[1:-1, 1:-1]
+    raise CameraError('unsupported pixel format %s' % order)
 
 
 # ------------------------------------------------------------------ Basler
@@ -78,7 +114,20 @@ class PylonCamera(Camera):
             node = n.GetNode(name)
             if node is not None:
                 _try(setattr, node, 'Value', v)
-        setv('PixelFormat', 'BayerGR8')
+        # a raw Bayer format the camera really accepts: 12-bit first, GR preferred
+        pf = n.GetNode('PixelFormat')
+        self.bayer = None
+        for order in BAYER_ORDERS:
+            if _try(setattr, pf, 'Value', order) and str(pf.Value) == order:
+                self.bayer = order
+                break
+        if self.bayer is None:
+            cur = str(pf.Value)
+            _try(self.cam.Close)
+            raise CameraError('This camera offers no raw Bayer pixel format (it is set to %s); '
+                              'BeamLab needs the raw colour pixels.' % cur)
+        self.full = bayer_full(self.bayer)
+        self._dtype = np.uint16 if self.full > 255 else np.uint8
         setv('ExposureAuto', 'Off')
         setv('GainAuto', 'Off')
         setv('BalanceWhiteAuto', 'Off')
@@ -103,7 +152,7 @@ class PylonCamera(Camera):
         try:
             if not res.GrabSucceeded():
                 raise CameraError('grab failed: %s' % res.ErrorDescription)
-            raw = np.array(res.Array, dtype=np.uint8, copy=True)
+            raw = np.ascontiguousarray(to_gr8(np.asarray(res.Array, dtype=self._dtype), self.bayer))
         finally:
             res.Release()
         temp = None
@@ -144,7 +193,18 @@ class IC4Camera(Camera):
         g.device_open(dev)
         pm = g.device_property_map
         self.pm = pm
-        _try(pm.set_value, ic4.PropId.PIXEL_FORMAT, ic4.PixelFormat.BayerGR8)
+        self.bayer = None
+        # 8-bit only here: how IC4 cameras deliver 12-bit (packed / MSB-aligned) is
+        # not tested on real hardware yet
+        for order in BAYER_ORDERS_8:
+            fmt = getattr(ic4.PixelFormat, order, None)
+            if fmt is not None and _try(pm.set_value, ic4.PropId.PIXEL_FORMAT, fmt):
+                self.bayer = order
+                break
+        if self.bayer is None:
+            _try(g.device_close)
+            raise CameraError('This camera offers no 8-bit Bayer pixel format; '
+                              'BeamLab needs the raw colour pixels.')
         _try(pm.set_value, ic4.PropId.EXPOSURE_AUTO, 'Off')
         _try(pm.set_value, ic4.PropId.GAIN_AUTO, 'Off')
         _try(pm.set_value, ic4.PropId.GAIN, 0.0)
@@ -173,7 +233,8 @@ class IC4Camera(Camera):
             temp = float(self.pm.get_value_float('DeviceTemperature'))
         except Exception:
             pass
-        return a.astype(np.uint8), self.pm.get_value_float(self.ic4.PropId.EXPOSURE_TIME), temp
+        a = np.ascontiguousarray(to_gr8(a.astype(np.uint8), self.bayer))
+        return a, self.pm.get_value_float(self.ic4.PropId.EXPOSURE_TIME), temp
 
     def close(self):
         _try(self.g.stream_stop)
@@ -184,8 +245,9 @@ class IC4Camera(Camera):
 
 class SimCamera(Camera):
     """Synthetic far-field camera for testing without the LBA: an elliptical
-    Gaussian spot per laser colour, wandering slightly, on a BayerGR8 sensor with
-    dark level, shot noise and 8-bit saturation. Ground truth is in `self.truth`."""
+    Gaussian spot per laser colour, wandering slightly, on a BayerGR sensor with
+    dark level, shot noise and saturation (bits=8: 0..255; bits=12: 0..4095, the
+    same light 16x finer, like the LBA's Basler). Ground truth is in `self.truth`."""
     name = 'Simulator'
     serial = 'SIM0001'
     model = 'Simulated LBA'
@@ -197,8 +259,12 @@ class SimCamera(Camera):
 
     def __init__(self, width=1440, height=1080, powers_w=(0.6, 0.4, 0.3),
                  sigma_px=(18.0, 12.0), counts_per_w_ms=3000.0, seed=1, wander=True,
-                 fps=30.0, laser_on_after=0):
+                 fps=30.0, laser_on_after=0, bits=8):
         self.laser_on_after = laser_on_after     # frames of darkness first (for the zero)
+        self.full = float(2 ** bits - 1)
+        self.bayer = 'BayerGR%d' % bits
+        self._u = self.full / 255.0              # 12-bit: same light, 16x more counts
+        self._dtype = np.uint16 if bits > 8 else np.uint8
         self.w, self.h = width, height
         self.powers = np.array(powers_w, dtype=float)
         self.sigma = sigma_px            # in SENSOR pixels
@@ -241,8 +307,8 @@ class SimCamera(Camera):
         # dark level + read noise: a bank of pre-made noise frames (making 1.5 M
         # gaussian numbers per frame cost ~60 ms and capped the simulator at ~3 fps)
         if not hasattr(self, '_noise'):
-            self._noise = [np.clip(np.floor(3.5 + self.rng.normal(0, 1.0, (self.h, self.w))), 0, 255)
-                           .astype(np.uint8) for _ in range(6)]
+            self._noise = [np.clip(np.floor((3.5 + self.rng.normal(0, 1.0, (self.h, self.w))) * self._u),
+                                   0, self.full).astype(self._dtype) for _ in range(6)]
         # random even shift each frame, so the noise is NOT the same pattern frame to frame
         # (a repeating pattern is fixed-pattern noise, which the dark frame would remove)
         sy_, sx_ = 2 * int(self.rng.integers(self.h // 2)), 2 * int(self.rng.integers(self.w // 2))
@@ -259,9 +325,10 @@ class SimCamera(Camera):
                 sig += self.mask[c, y0:y1, x0:x1] * (seen[c] * norm)
             sig *= spot
             sig += self.rng.normal(0, 1.0, sig.shape).astype(np.float32) * np.sqrt(sig * 0.3)  # shot noise
+            sig *= np.float32(self._u)
             # round (not truncate): truncating lost 0.5 count/pixel inside the window only,
             # a step at the window edge that read as negative power on dim colours
-            raw[y0:y1, x0:x1] = np.clip(np.floor(raw[y0:y1, x0:x1] + sig + 0.5), 0, 255).astype(np.uint8)
+            raw[y0:y1, x0:x1] = np.clip(np.floor(raw[y0:y1, x0:x1] + sig + 0.5), 0, self.full).astype(self._dtype)
         self.truth = {'cx_sensor': cx, 'cy_sensor': cy, 'sigma': self.sigma}
         return raw, self.exp, 35.0
 
@@ -279,7 +346,7 @@ def _cap(cam):
 def open_camera(kind='auto', serial=None):
     """'auto' tries Basler then Imaging Source and reports why both failed."""
     if kind != 'auto':
-        return _cap(BACKENDS[kind](serial) if kind != 'sim' else SimCamera(laser_on_after=15))
+        return _cap(BACKENDS[kind](serial) if kind != 'sim' else SimCamera(laser_on_after=15, bits=12))
     errs = []
     for cls in (PylonCamera, IC4Camera):
         try:

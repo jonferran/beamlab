@@ -44,10 +44,14 @@ divergence: **angle = size on sensor / focal length**.
   - **1/e²**: width at 13.5 % of the peak
   - **D4σ**: ISO 11146 second-moment width, background-subtracted with no
     noise clipping, inside an iterated 3 × D4σ aperture
-- **Spatial accuracy:** each colour's centre is corrected for its Bayer pixel
-  offset. Frames are only averaged while the beam stands still, so a moving
-  beam is never smeared. With no beam on the sensor, BeamLab says so instead of
-  measuring noise.
+- **Which spot:** the LBA shows three spots side by side. BeamLab measures the
+  one you choose (**Measure**: right, middle, left or brightest; right by
+  default) and keeps the others out of the measuring box.
+- **Spatial accuracy:** 12-bit raw pixels when the camera offers them (4096
+  levels instead of 256: a dim beam's wings are resolved finely). Each
+  colour's centre is corrected for its Bayer pixel offset. Frames are only
+  averaged while the beam stands still, so a moving beam is never smeared.
+  With no beam on the sensor, BeamLab says so instead of measuring noise.
 - **Power** (optional): calibrate each laser once with a known power. A 3×3
   colour response then separates the lasers and gives watts per colour and
   power density (W/mrad, W/mrad²).
@@ -61,19 +65,28 @@ divergence: **angle = size on sensor / focal length**.
   off)** button.
 - **Power:** shoot ONE laser at a known power into the sensor, type the watts,
   press Calibrate. Repeat for each colour. Calibrations are saved per camera
-  serial number.
+  serial number. Auto exposure can stay on: the exposure is held still while
+  calibrating or zeroing, then auto exposure carries on.
+- **Learn colours** (display only, no power meter): turn ONE laser on, press
+  its Learn button, repeat for each. Overlapping beams then separate on
+  screen, so each laser's sliders act on that laser alone.
 
 ## Features
 
 - Live view with **auto zoom**: fits all spots, and zooms out on the very next
   frame if a beam is adjusted too far. Also manual zoom (wheel), pan
-  (right-drag), and centring on the beam or the crosshair.
-- **Display colours for goggles:** show each laser in any colour, plus a
-  brightness slider per laser. Measurements are not affected.
+  (right-drag), and centring on the beam or the crosshair. Zoomed in, the
+  zoomed area is sent at full resolution and drawn smoothly.
+- **Display colours for goggles:** show each laser in any colour, with its own
+  brightness, boost and contrast sliders, plus master boost and contrast.
+  **Balance lasers** shows each laser at full brightness (the camera sees red
+  much weaker than the eye). Right-click any slider to reset it. Measurements
+  are not affected.
 - **Crosshair** reference: left-click the picture to place it, or centre it, or snap it
   to the beam or one colour.
 - **Snapshot:** a still reference picture shown next to the live view, with
-  its divergence numbers, saved as PNG + JSON.
+  its divergence numbers, saved as PNG + JSON. **Overlay on live** lays it over
+  the live picture, to line up one laser with another that is switched off.
 - **Exposure:** logarithmic slider, plus a robust auto exposure (ignores hot
   pixels, steps down by how saturated the image is, never hunts).
 - **Idle full screen** (screensaver style) with a compact readout; any mouse

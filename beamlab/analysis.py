@@ -66,6 +66,9 @@ def _block_mean(img, f):
     if img.dtype == np.uint8:                 # raw frames: integer sums, no float copy
         s = a.sum(axis=3, dtype=np.uint16).sum(axis=1, dtype=np.uint32)
         return s.astype(np.float32) * np.float32(1.0 / (f * f))
+    if img.dtype == np.uint16:                # 12-bit raw frames
+        s = a.sum(axis=3, dtype=np.uint32).sum(axis=1, dtype=np.uint32)
+        return s.astype(np.float32) * np.float32(1.0 / (f * f))
     return a.sum(axis=3, dtype=np.float32).sum(axis=1, dtype=np.float32) * np.float32(1.0 / (f * f))
 
 
@@ -74,14 +77,49 @@ def _block_mean(img, f):
 MIN_SNR = 8.0
 
 
-def auto_roi(img, level=0.05, margin=2.6, min_size=16):
-    """ROI around the brightest blob: pixels above `level` of the peak ABOVE THE
-    DARK LEVEL, bounding box grown by `margin` (x the box size) so the wings are
-    inside. 2.6 x the 5 % box reaches ~6 sigma from the centre, the room the ISO
-    3 x D4-sigma aperture needs (1.5 x reached only 3.7 sigma: D4s read ~4 % small). Found on a 4x4 block-averaged copy (16x fewer pixels: fast, and the
-    averaging stops noise from winning). Returns (x0, y0, x1, y1) in img
-    coordinates, or None if there is no beam (peak < MIN_SNR noise sigmas)."""
-    f = 4 if min(img.shape) >= 64 else 1
+def _grow_blob(mask, seed):
+    """The connected part of `mask` (8-neighbours) that contains `seed` (y, x).
+    Grown by repeated dilation inside the mask: a few dozen cheap passes on the
+    small block-averaged image (no scipy needed)."""
+    # work in a small window around the seed, doubled whenever the spot reaches its
+    # edge: a spot is ~30 block px across, the image ~480 x 270 (50 ms -> a few ms)
+    H, W = mask.shape
+    sy, sx = seed
+    r = 16
+    comp = None
+    while True:
+        y0, y1 = max(0, sy - r), min(H, sy + r + 1)
+        x0, x1 = max(0, sx - r), min(W, sx + r + 1)
+        m = mask[y0:y1, x0:x1]
+        c = np.zeros_like(m)
+        if comp is None:
+            c[sy - y0, sx - x0] = True
+        else:
+            c[cy0 - y0:cy0 - y0 + comp.shape[0], cx0 - x0:cx0 - x0 + comp.shape[1]] = comp
+        n = int(c.sum())
+        while True:
+            g = c.copy()
+            g[1:] |= c[:-1]
+            g[:-1] |= c[1:]
+            g[:, 1:] |= g[:, :-1].copy()
+            g[:, :-1] |= g[:, 1:].copy()
+            g &= m
+            k = int(g.sum())
+            if k == n:
+                break
+            c, n = g, k
+        touches = ((y0 > 0 and c[0].any()) or (y1 < H and c[-1].any())
+                   or (x0 > 0 and c[:, 0].any()) or (x1 < W and c[:, -1].any()))
+        if not touches:
+            out = np.zeros_like(mask)
+            out[y0:y1, x0:x1] = c
+            return out
+        comp, cy0, cx0 = c, y0, x0
+        r *= 2
+
+
+def spot_mask_info(img, level=0.05, f=4):
+    """(block image, dark, noise, peak, mask of pixels above `level` of the peak)."""
     sm = _block_mean(img.astype(np.float32, copy=False), f) if f > 1 else img.astype(np.float32)
     flat = sm.ravel()
     sub = flat[::7] if flat.size > 20000 else flat       # dark level / noise from a sample
@@ -89,9 +127,86 @@ def auto_roi(img, level=0.05, margin=2.6, min_size=16):
     noise = float(np.median(np.abs(sub - dark))) * 1.4826
     noise = max(noise, 0.5 / f)                          # 8-bit quantisation floor
     peak = float(sm.max()) - dark
+    return sm, dark, noise, peak, (sm - dark >= peak * level)
+
+
+SPOT_CHOICES = ('right', 'middle', 'left', 'brightest')
+
+
+def _find_spots(sm, dark, peak, mask, min_rel=0.15, max_spots=9):
+    """Separate spots on the block image: list of dicts {mask, peak, seed, cx, box}
+    (box = block-px bbox), each with a peak of at least `min_rel` of the brightest
+    (specks of noise or speckle are not counted), brightest first."""
+    rest = mask.copy()
+    out = []
+    while len(out) < max_spots and rest.any():
+        vals = np.where(rest, sm - dark, -np.inf)
+        i = np.unravel_index(int(np.argmax(vals)), sm.shape)
+        if vals[i] < min_rel * peak:
+            break
+        blob = _grow_blob(rest, i)
+        rest &= ~blob
+        ys, xs = np.nonzero(blob)
+        out.append({'mask': blob, 'peak': float(vals[i]), 'seed': i, 'cx': float(xs.mean()),
+                    'box': (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)})
+    return out
+
+
+def _pick(spots, spot):
+    """The spot to measure: 'right' / 'left' / 'middle' (by position, left to right)
+    or 'brightest'."""
+    if not spots:
+        return None
+    if spot in ('right', 'left', 'middle') and len(spots) > 1:
+        by_x = sorted(spots, key=lambda s: s['cx'])
+        return by_x[-1] if spot == 'right' else by_x[0] if spot == 'left' else by_x[len(by_x) // 2]
+    return spots[0]
+
+
+def count_spots(img, level=0.05, min_rel=0.15, max_spots=9):
+    """How many separate spots the picture has (each with a peak of at least
+    `min_rel` of the brightest; specks of noise or speckle are not counted)."""
+    f = 4 if min(img.shape) >= 64 else 1
+    sm, dark, noise, peak, mask = spot_mask_info(img, level, f)
+    if peak <= MIN_SNR * noise:
+        return 0
+    return len(_find_spots(sm, dark, peak, mask, min_rel, max_spots))
+
+
+def auto_roi(img, level=0.05, margin=2.6, min_size=16, blob=True, spot='brightest'):
+    """ROI around ONE spot: the connected patch of pixels above `level` of that
+    spot's own peak (ABOVE THE DARK LEVEL), bounding box grown by `margin` (x the box
+    size) so the wings are inside, but never into another spot. Which spot: `spot`
+    = 'brightest', or by position 'right' / 'middle' / 'left' (the LBA always shows
+    3 spots side by side and Jon measures the right one). Before this, every pixel
+    above 5 % went into one box, so the 1/e2 and D4s 'widths' spanned all three
+    spots. blob=False: every pixel above the level (no spot picking).
+    2.6 x the 5 % box reaches ~6 sigma from the centre, the room the ISO
+    3 x D4-sigma aperture needs (1.5 x reached only 3.7 sigma: D4s read ~4 % small).
+    Found on a 4x4 block-averaged copy (16x fewer pixels: fast, and the averaging
+    stops noise from winning). Returns (x0, y0, x1, y1) in img coordinates, or
+    None if there is no beam (peak < MIN_SNR noise sigmas)."""
+    f = 4 if min(img.shape) >= 64 else 1
+    sm, dark, noise, peak, mask = spot_mask_info(img, level, f)
     if peak <= MIN_SNR * noise:
         return None
-    ys, xs = np.nonzero(sm - dark >= peak * level)
+    others = []
+    if blob:
+        if spot == 'brightest':
+            mask = _grow_blob(mask, np.unravel_index(int(np.argmax(sm)), sm.shape))
+            spots = None
+        else:
+            spots = _find_spots(sm, dark, peak, mask)
+            chosen = _pick(spots, spot)
+            if chosen is None:
+                return None
+            # re-cut at `level` of THIS spot's own peak (a dimmer side spot would
+            # otherwise get a wider, lower cut than the brightest one)
+            own = (sm - dark >= chosen['peak'] * level) & ~np.logical_or.reduce(
+                [s['mask'] for s in spots if s is not chosen] or [np.zeros_like(mask)])
+            mask = _grow_blob(own, chosen['seed'])
+            others = [s['box'] for s in spots if s is not chosen]
+    ys, xs = np.nonzero(mask)
     if xs.size == 0:
         return None
     xs0, xs1 = xs.min() * f, (xs.max() + 1) * f          # back to full-res pixels
@@ -100,8 +215,34 @@ def auto_roi(img, level=0.05, margin=2.6, min_size=16):
     hw = max(min_size / 2, (xs1 - xs0) * margin / 2)
     hh = max(min_size / 2, (ys1 - ys0) * margin / 2)
     h, w = img.shape
-    return (max(0, int(cx - hw)), max(0, int(cy - hh)),
-            min(w, int(math.ceil(cx + hw)) + 1), min(h, int(math.ceil(cy + hh)) + 1))
+    x0, y0 = max(0, int(cx - hw)), max(0, int(cy - hh))
+    x1, y1 = min(w, int(math.ceil(cx + hw)) + 1), min(h, int(math.ceil(cy + hh)) + 1)
+    # keep the margin out of the neighbouring spots: stop halfway to them (only
+    # across a real gap; a neighbour whose faint edge overlaps this spot's own box
+    # is left alone - clipping there turned the box inside out and stopped the
+    # camera loop with an empty power ROI)
+    full = (x0, y0, x1, y1)
+    for bx0, by0, bx1, by1 in others:
+        ox0, oy0, ox1, oy1 = bx0 * f, by0 * f, bx1 * f, by1 * f
+        if ox1 <= x0 or ox0 >= x1 or oy1 <= y0 or oy0 >= y1:
+            continue                                     # does not reach into the box
+        gx = max(ox0 - xs1, xs0 - ox1)                   # gap between the spots, x / y
+        gy = max(oy0 - ys1, ys0 - oy1)
+        if gx <= 0 and gy <= 0:
+            continue
+        if gx >= gy:
+            if ox0 >= xs1:
+                x1 = min(x1, int((xs1 + ox0) / 2))
+            else:
+                x0 = max(x0, int(math.ceil((ox1 + xs0) / 2)))
+        else:
+            if oy0 >= ys1:
+                y1 = min(y1, int((ys1 + oy0) / 2))
+            else:
+                y0 = max(y0, int(math.ceil((oy1 + ys0) / 2)))
+    if x1 - x0 < max(4, xs1 - xs0) or y1 - y0 < max(4, ys1 - ys0):
+        return full                                      # never smaller than the spot itself
+    return (x0, y0, x1, y1)
 
 
 def subtract_background(img, border=4, noise_k=3.0):
@@ -160,13 +301,13 @@ def moments(img):
     return cx, cy, 4 * math.sqrt(vx), 4 * math.sqrt(vy)
 
 
-def quick_centroid(raw):
+def quick_centroid(raw, spot='brightest'):
     """Beam centroid of one raw frame (analysis px), or None. Used to tell whether
     the beam moved between frames before averaging them."""
     # 4x4 sensor-pixel blocks (= 2x2 analysis px, every Bayer colour inside): no
     # colour split needed, 16x fewer pixels, and averaging keeps the centroid exact
     sm = _block_mean(raw, 4)
-    roi = auto_roi(sm)
+    roi = auto_roi(sm, spot=spot)
     if roi is None:
         return None
     x0, y0, x1, y1 = roi
@@ -191,12 +332,13 @@ class MotionAwareStack(object):
         self.frames = []
         self.cents = []
         self.restarts = 0
+        self.spot = 'brightest'      # which spot's centre decides "the beam moved"
 
     def clear(self):
         self.frames, self.cents = [], []
 
     def add(self, raw, n):
-        c = quick_centroid(raw) if n > 1 else None
+        c = quick_centroid(raw, self.spot) if n > 1 else None
         if n > 1 and c is not None and self.cents:
             ref = self.cents[-1]
             if ref is None or abs(c[0] - ref[0]) > self.tol or abs(c[1] - ref[1]) > self.tol:
@@ -285,7 +427,7 @@ class Optics(object):
 
 
 def analyse(raw, exposure_us, optics, roi=None, auto=True, response=None,
-            zero_px=None, dark=None, planes=None):
+            zero_px=None, dark=None, planes=None, spot='brightest'):
     """Full measurement of one (possibly stacked) BayerGR8 frame.
     roi is in analysis (half-res) pixels. dark = mean frame taken with the laser
     off (same exposure), subtracted first. planes = (r, g, b) if the caller already
@@ -299,7 +441,7 @@ def analyse(raw, exposure_us, optics, roi=None, auto=True, response=None,
     lum = r + g + b
     no_beam = False
     if auto or roi is None:
-        found = auto_roi(lum)
+        found = auto_roi(lum, spot=spot)
         no_beam = found is None
         roi = found or (0, 0, lum.shape[1], lum.shape[0])
     else:
@@ -334,6 +476,8 @@ def analyse(raw, exposure_us, optics, roi=None, auto=True, response=None,
     zx, zy = zero_px if zero_px else (lum.shape[1] / 2.0, lum.shape[0] / 2.0)
     out.update({
         'ok': True,
+        # separate spots in the picture; only the brightest is measured
+        'n_spots': count_spots(lum),
         'cx_px': cxa, 'cy_px': cya,
         'profile_x': px, 'profile_y': py,
         'fwhm_x': fx[0] * k, 'fwhm_y': fy[0] * k,
@@ -348,9 +492,11 @@ def analyse(raw, exposure_us, optics, roi=None, auto=True, response=None,
     out['e2_geo'] = math.sqrt(out['e2_x'] * out['e2_y']) if ex[0] == ex[0] and ey[0] == ey[0] else math.nan
     # power needs ALL the light: a generous ROI that does not shrink for a dim laser
     # (a beam-sized ROI would cut a different share of the wings at each brightness)
-    proi = auto_roi(lum, level=0.01, margin=3.0) or roi
+    proi = auto_roi(lum, level=0.01, margin=3.0, spot=spot) or roi
     if not auto and roi is not None:
         proi = roi
+    if proi[2] - proi[0] < 2 or proi[3] - proi[1] < 2:
+        proi = roi                                       # never measure an empty box
     px0, py0, px1, py1 = proi
     rr, gg, bb = (c[py0:py1, px0:px1] for c in (r, g, b))
     # power: plain dark-level subtraction, NO noise clipping (clipping throws away
@@ -425,7 +571,7 @@ class AutoExposure(object):
             ratio = sat / lit
             factor = 0.5 if ratio < 0.1 else (0.25 if ratio < 0.4 else 0.1)
             new, self.state = exposure_us * factor, 'saturated'
-        elif peak < 6:                                 # nothing visible: search upwards
+        elif peak < 6 * self.full / 255.0:             # nothing visible: search upwards
             new, self.state = exposure_us * 4.0, 'dark'
         elif abs(frac - self.target) <= self.band:
             self.state = 'settled'
@@ -449,7 +595,7 @@ def next_exposure(exposure_us, peak_raw, lo_us, hi_us, target=0.85, full=255):
     """Auto exposure: scale so the brightest Bayer pixel sits at `target` of full
     Saturated -> halve. Dark -> back to 5 ms."""
     peak = max(peak_raw)
-    if peak < 8:
+    if peak < 8 * full / 255.0:
         new = 5000.0
     elif peak >= full - 1:
         new = exposure_us * 0.5
